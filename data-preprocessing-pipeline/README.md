@@ -124,7 +124,7 @@ GEBCO (bathymetry)       ─┘
 ## Repository Structure
 
 ```
-blame-the-ocean/
+data-preprocessing-pipeline/
 ├── pipeline.py        # Main orchestration — run this
 ├── config.py          # All settings, paths, variable lists, norm stats
 ├── loader.py          # Format detection, downloaders for all 4 sources
@@ -220,6 +220,13 @@ FORECAST_HORIZON = 5      # forecast steps H
 ### Full run (downloads everything)
 
 ```bash
+python data-preprocessing-pipeline/pipeline.py --bathy data-preprocessing-pipeline/data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
+```
+
+Or run from within the pipeline directory:
+
+```bash
+cd data-preprocessing-pipeline
 python pipeline.py --bathy data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
 ```
 
@@ -229,26 +236,26 @@ Required files differ by `ERA5_DOWNLOAD_METHOD` in `config.py`.
 
 **`daily_stats` mode (default) — 3 separate ERA5 files:**
 ```bash
-python pipeline.py \
+python data-preprocessing-pipeline/pipeline.py \
     --no-download \
-    --chl         data/raw/cmems_mod_glo_bgc_my_0.25deg_P1D-m_2021-01-01_2025-12-31.nc \
-    --physics     data/raw/cmems_mod_glo_phy_my_0.083deg_P1D-m_2021-01-01_2025-12-31.nc \
-    --era5-wind   data/raw/era5_wind_2021-01-01_2025-12-31.nc \
-    --era5-msl    data/raw/era5_msl_2021-01-01_2025-12-31.nc \
-    --era5-precip data/raw/era5_precip_2021-01-01_2025-12-31.nc \
-    --discharge   data/raw/glofas_2021-01-01_2025-12-31.nc \
-    --bathy       data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
+    --chl         data-preprocessing-pipeline/data/raw/cmems_mod_glo_bgc_my_0.25deg_P1D-m_2021-01-01_2025-12-31.nc \
+    --physics     data-preprocessing-pipeline/data/raw/cmems_mod_glo_phy_my_0.083deg_P1D-m_2021-01-01_2025-12-31.nc \
+    --era5-wind   data-preprocessing-pipeline/data/raw/era5_wind_2021-01-01_2025-12-31.nc \
+    --era5-msl    data-preprocessing-pipeline/data/raw/era5_msl_2021-01-01_2025-12-31.nc \
+    --era5-precip data-preprocessing-pipeline/data/raw/era5_precip_2021-01-01_2025-12-31.nc \
+    --discharge   data-preprocessing-pipeline/data/raw/glofas_2021-01-01_2025-12-31.nc \
+    --bathy       data-preprocessing-pipeline/data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
 ```
 
 **`hourly` mode — 1 combined ERA5 file (u10, v10, msl, tp together):**
 ```bash
-python pipeline.py \
+python data-preprocessing-pipeline/pipeline.py \
     --no-download \
-    --chl       data/raw/cmems_mod_glo_bgc_my_0.25deg_P1D-m_2021-01-01_2025-12-31.nc \
-    --physics   data/raw/cmems_mod_glo_phy_my_0.083deg_P1D-m_2021-01-01_2025-12-31.nc \
-    --era5-wind data/raw/era5_hourly_2021-01-01_2025-12-31.nc \
-    --discharge data/raw/glofas_2021-01-01_2025-12-31.nc \
-    --bathy     data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
+    --chl       data-preprocessing-pipeline/data/raw/cmems_mod_glo_bgc_my_0.25deg_P1D-m_2021-01-01_2025-12-31.nc \
+    --physics   data-preprocessing-pipeline/data/raw/cmems_mod_glo_phy_my_0.083deg_P1D-m_2021-01-01_2025-12-31.nc \
+    --era5-wind data-preprocessing-pipeline/data/raw/era5_hourly_2021-01-01_2025-12-31.nc \
+    --discharge data-preprocessing-pipeline/data/raw/glofas_2021-01-01_2025-12-31.nc \
+    --bathy     data-preprocessing-pipeline/data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
 ```
 Note: `--era5-msl` and `--era5-precip` are not needed in hourly mode.
 The combined file is identified by `--era5-wind` and contains all ERA5 variables.
@@ -256,7 +263,7 @@ The combined file is identified by `--era5-wind` and contains all ERA5 variables
 ### Reuse existing normalization stats
 
 ```bash
-python pipeline.py --bathy data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc --load-stats
+python data-preprocessing-pipeline/pipeline.py --bathy data-preprocessing-pipeline/data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc --load-stats
 ```
 
 ### All CLI options
@@ -342,7 +349,7 @@ All download functions are **fully resumable**. If the pipeline is interrupted a
 
 ```bash
 # Just rerun the same command — completed files are automatically skipped
-python pipeline.py --bathy data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
+python data-preprocessing-pipeline/pipeline.py --bathy data-preprocessing-pipeline/data/raw/gebco_2025_n22.5_s5.5_w79.5_e95.5.nc
 ```
 
 Completed files are detected by filename. Corrupt or incomplete downloads are detected by attempting to open them with xarray and re-downloaded automatically.
@@ -354,7 +361,13 @@ Completed files are detected by filename. Corrupt or incomplete downloads are de
 Run the built-in sanity check after the pipeline completes:
 
 ```bash
-python dataset.py
+python data-preprocessing-pipeline/dataset.py
+```
+
+Or from within the pipeline directory:
+
+```bash
+cd data-preprocessing-pipeline && python dataset.py
 ```
 
 Expected output:
