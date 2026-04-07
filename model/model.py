@@ -37,6 +37,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+import sys
+from pathlib import Path
+_MODEL_DIR = Path(__file__).resolve().parent
+if str(_MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(_MODEL_DIR))
+if str(_MODEL_DIR / "encoders") not in sys.path:
+    sys.path.insert(0, str(_MODEL_DIR / "encoders"))
+
 from masknet import MaskNet
 from optical_encoder import OpticalEncoder
 from physics_encoder import PhysicsEncoder
