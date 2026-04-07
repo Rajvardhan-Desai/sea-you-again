@@ -144,8 +144,9 @@ def holdout_recon_loss(
     grad_diff = (pred_lap - target_lap).pow(2)
     grad_loss = (grad_diff * sup_mask).sum() / n_valid
 
-    # Weight the gradient term at 10% of NLL to avoid dominating
-    return nll_loss + 0.1 * grad_loss
+    # Weight the gradient term low to avoid gradient explosion through
+    # ReconHead's dilated conv stack (was 0.1, caused NaN at epoch 73)
+    return nll_loss + 0.02 * grad_loss
 
 
 # ======================================================================
