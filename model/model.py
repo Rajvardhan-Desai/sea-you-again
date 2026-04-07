@@ -161,7 +161,11 @@ class TemporalReconAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        # Learnable temperature for cosine-similarity attention after L2 norm.
+        # Standard 1/sqrt(d) scale compresses logits to ~[-0.125, 0.125] after
+        # L2 norm, producing near-uniform attention. A learnable scale lets
+        # the model discover the right sharpness.
+        self.logit_scale = nn.Parameter(torch.tensor(10.0))
 
         self.q_proj = nn.Conv2d(embed_dim, embed_dim, 1, bias=False)
         self.k_proj = nn.Conv2d(embed_dim, embed_dim, 1, bias=False)
@@ -208,8 +212,8 @@ class TemporalReconAttention(nn.Module):
             k_norm = k_pooled.norm(dim=-1, keepdim=True).clamp(min=1e-3)
             k_pooled = k_pooled / k_norm
 
-            # Scaled dot-product attention
-            attn = (q * self.scale) @ k_pooled.transpose(-2, -1)  
+            # Cosine-similarity attention with learnable temperature
+            attn = (q @ k_pooled.transpose(-2, -1)) * self.logit_scale  
             attn = attn.softmax(dim=-1)
 
             out = attn @ v_pooled                       
@@ -262,8 +266,8 @@ class ForecastHead(nn.Module):
         self.gru_z = nn.Conv2d(refine_dim * 2, refine_dim, 3, padding=1)
         self.gru_r = nn.Conv2d(refine_dim * 2, refine_dim, 3, padding=1)
         self.gru_n = nn.Conv2d(refine_dim * 2, refine_dim, 3, padding=1)
-        self.gru_norm = nn.GroupNorm(4, refine_dim)
         self.refine_out = nn.Conv2d(refine_dim, 1, kernel_size=1)
+        self.h_init = nn.Conv2d(D, refine_dim, 1)  # warm start from decoded state
         self.refine_dim = refine_dim
 
     def _gru_step(self, x: Tensor, h: Tensor) -> Tensor:
@@ -282,8 +286,7 @@ class ForecastHead(nn.Module):
         parallel_preds = [head(shared) for head in self.step_heads]
 
         # Stage 2: autoregressive refinement
-        h = torch.zeros(B, self.refine_dim, H, W,
-                        device=decoded.device, dtype=decoded.dtype)
+        h = self.h_init(decoded)                      # warm start from decoded features
         refined = []
         for t in range(self.H_fcast):
             pred_t = parallel_preds[t]                     # (B, 1, H, W)

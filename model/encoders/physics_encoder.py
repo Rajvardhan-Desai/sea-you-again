@@ -75,7 +75,7 @@ class PhysicsEncoder(nn.Module):
         self.C_static  = C_static
         self.embed_dim = embed_dim
 
-        C_in = C_physics + C_wind + C_static     # 9 by default
+        C_in = C_physics + C_wind + C_static     # 12 by default (6+4+2)
 
         # Reuse the Swin-UNet backbone — different instance, separate weights
         self.backbone = OpticalEncoder(

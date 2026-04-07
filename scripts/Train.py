@@ -437,7 +437,11 @@ def load_checkpoint(
     device: torch.device,
 ) -> tuple[int, int, float]:
     ckpt = torch.load(path, map_location=device)
-    unwrap_model(model).load_state_dict(ckpt["model"])
+    result = unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
+    if result.missing_keys:
+        log.warning(f"Missing keys in checkpoint (random init): {result.missing_keys}")
+    if result.unexpected_keys:
+        log.warning(f"Unexpected keys in checkpoint (ignored): {result.unexpected_keys}")
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
