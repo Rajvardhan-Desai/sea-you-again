@@ -69,7 +69,6 @@ class ModelConfig:
     n_experts: int = 4
     n_eri_levels: int = 5
     holdout_frac: float = 0.30
-    bloom_threshold: float = 0.0
 
 
 # ======================================================================
@@ -292,7 +291,6 @@ class ForecastHead(nn.Module):
             pred_t = parallel_preds[t]                     # (B, 1, H, W)
             x = self.pred_embed(pred_t)                    # (B, refine_dim, H, W)
             h = self._gru_step(x, h)                       # (B, refine_dim, H, W)
-            # Removed h = self.gru_norm(h) to prevent gradient explosion
             correction = self.refine_out(h)                # (B, 1, H, W)
             correction = correction.clamp(-1.0, 1.0)       # prevent runaway corrections
             refined.append(pred_t + correction)            # residual refinement
