@@ -23,6 +23,7 @@ import hashlib
 import logging
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +37,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "model" / "encoders"))
+sys.path.insert(0, str(_REPO_ROOT / "model"))
+sys.path.insert(0, str(_REPO_ROOT / "data-preprocessing-pipeline"))
 
 from augment import augment_batch
 from dataset import build_dataloaders, MARASSDataset

@@ -422,7 +422,9 @@ def main():
     )
     use_amp = not args.no_amp and device.type == "cuda"
 
-    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "encoders"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data-preprocessing-pipeline"))
     from model import MARASSModel, ModelConfig
     from dataset import build_dataloaders
 
