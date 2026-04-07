@@ -783,7 +783,10 @@ def evaluate(args: argparse.Namespace) -> None:
     use_amp = not args.no_amp and device.type == "cuda"
     log.info(f"Device: {device}  |  AMP: {use_amp}")
 
-    sys.path.insert(0, str(Path(__file__).parent))
+    _repo = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(_repo / "model" / "encoders"))
+    sys.path.insert(0, str(_repo / "model"))
+    sys.path.insert(0, str(_repo / "data-preprocessing-pipeline"))
     from model import MARASSModel, ModelConfig
     from loss import build_eri_target
     from dataset import build_dataloaders
