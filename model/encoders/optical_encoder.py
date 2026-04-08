@@ -50,6 +50,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as ckpt
 
 
 # ======================================================================
@@ -483,7 +484,7 @@ class OpticalEncoder(nn.Module):
         """
         B, T, C, H, W = optical.shape
         x = optical.view(B * T, C, H, W)
-        x = self.forward_single(x)              # (B*T, embed_dim, H, W)
+        x = ckpt(self.forward_single, x, use_reentrant=False)
         return x.view(B, T, self.embed_dim, H, W)
 
     def load_satmae_patch_embed(self, satmae_ckpt_path: str) -> None:
