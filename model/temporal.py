@@ -46,6 +46,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as ckpt
 
 
 # ======================================================================
@@ -162,7 +163,7 @@ class ConvLSTMLayer(nn.Module):
         state = None
         outputs: list[Tensor] = []
         for t in range(T):
-            h, c = self.cell(x[:, t], state)
+            h, c = ckpt(self.cell, x[:, t], state, use_reentrant=False)
             state = (h, c)
             if return_sequence:
                 outputs.append(h)
