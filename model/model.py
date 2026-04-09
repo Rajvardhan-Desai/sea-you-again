@@ -20,10 +20,11 @@ Architectural fixes for identified bottlenecks:
               each step conditioned on the previous step's prediction
             → Fixes: forecast SSIM non-monotonicity, long-horizon quality
 
-    [FIX D] ERI with direct bloom count input
-            - Concatenate bloom_mask.sum(dim=1) as extra channel to ERI head
-            - Head gets direct access to the signal it needs to classify
-            → Fixes: ERI class 1 F1
+    [FIX D] ERI from learned features (v3.1: removed bloom_count leakage)
+            - v3 concatenated bloom_mask.sum(dim=1) — this was circular since
+              the ERI target IS bloom_count thresholded into bins
+            - v3.1 removes this, forcing honest prediction from learned features
+            → Fixes: ERI metric inflation from label leakage
 
 Unchanged: all encoders, Perceiver IO fusion, MoE decoder.
 """
@@ -92,10 +93,9 @@ class ReconHead(nn.Module):
     2. Uses dilated convolutions for multi-scale spatial context
     3. Receives a skip connection from the optical encoder for fine detail
 
-    The key insight: gap pixels need information from their NEIGHBORS,
-    not just their own 256-dim feature vector. A 5x5 dilated conv with
-    dilation=2 has an effective receptive field of 9x9, enough to reach
-    valid pixels 4 pixels away from a gap boundary.
+    v3.1: Added dilation=8 layer, extending the effective receptive field
+    from 9x9 to 25x25 pixels. Real cloud gaps span 15-30+ pixels, so
+    interior gap pixels need access to valid observations further away.
 
     Input:
         decoded:  (B, D, H, W)     from MoE decoder
@@ -116,18 +116,23 @@ class ReconHead(nn.Module):
             nn.GELU(),
         )
 
-        # Multi-scale spatial propagation
+        # Multi-scale spatial propagation (cumulative RF: 25x25)
         self.spatial = nn.Sequential(
-            # Standard 3x3 — immediate neighbors
+            # Standard 3x3 — immediate neighbors (RF: 3x3)
             nn.Conv2d(D, D, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, D),
             nn.GELU(),
-            # Dilated 3x3 (dilation=2) — 5x5 effective receptive field
+            # Dilated 3x3 (dilation=2) — (RF: 7x7)
             nn.Conv2d(D, D // 2, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.GroupNorm(8, D // 2),
             nn.GELU(),
-            # Dilated 3x3 (dilation=4) — 9x9 effective receptive field
+            # Dilated 3x3 (dilation=4) — (RF: 15x15)
             nn.Conv2d(D // 2, D // 4, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.GroupNorm(8, D // 4),
+            nn.GELU(),
+            # [v3.1] Dilated 3x3 (dilation=8) — (RF: 25x25)
+            # Reaches 12 pixels from gap boundary — covers most real cloud gaps
+            nn.Conv2d(D // 4, D // 4, kernel_size=3, padding=8, dilation=8, bias=False),
             nn.GroupNorm(8, D // 4),
             nn.GELU(),
         )
@@ -320,39 +325,34 @@ class UncertaintyHead(nn.Module):
 
 
 # ======================================================================
-# [FIX D] ERI head with direct bloom count input
+# [FIX D v3.1] ERI head — predict from learned features only
 # ======================================================================
 
 class ERIHead(nn.Module):
     """
-    ERI classification with bloom_mask.sum(dim=1) concatenated as an
-    extra input channel.
+    ERI classification from decoded spatiotemporal features.
 
-    The ERI target is literally bloom_mask.sum(dim=1) thresholded into
-    5 bins. Giving the head direct access to this count (as a normalized
-    float channel) makes the classification much easier, especially for
-    the class 0/1 boundary (0 vs 1 bloom day).
+    v3.1: Removed bloom_count input that was causing label leakage.
+    The ERI target is derived from bloom_mask.sum(dim=1) thresholded into
+    5 bins — passing that same count as input made the task trivially
+    circular. The head now predicts ERI purely from learned representations.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         D = cfg.embed_dim
-        # D channels from decoded + 1 channel for bloom count
         self.head = nn.Sequential(
-            nn.Conv2d(D + 1, D // 2, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, D // 2),
             nn.GELU(),
             nn.Conv2d(D // 2, cfg.n_eri_levels, kernel_size=1),
         )
 
-    def forward(self, decoded: Tensor, bloom_count: Tensor) -> Tensor:
+    def forward(self, decoded: Tensor) -> Tensor:
         """
-        decoded:     (B, D, H, W)
-        bloom_count: (B, H, W)  — bloom_mask.sum(dim=1), normalized to [0, 1]
+        decoded: (B, D, H, W) — MoE decoder output
         """
-        bc = bloom_count.unsqueeze(1) / 10.0   # normalize T=10 to [0, 1]
-        x = torch.cat([decoded, bc], dim=1)     # (B, D+1, H, W)
-        return self.head(x)                     # (B, 5, H, W)
+        return self.head(decoded)   # (B, 5, H, W)
 
 
 # ======================================================================
@@ -441,6 +441,107 @@ class TemporalModuleV3(nn.Module):
 
 
 # ======================================================================
+# [v3.1] Structured holdout — synthetic cloud gap generation
+# ======================================================================
+
+def _generate_structured_holdout(
+    obs_mask: Tensor,
+    target_frac: float = 0.30,
+    min_radius: int = 3,
+    max_radius: int = 15,
+    max_gaps: int = 12,
+) -> Tensor:
+    """
+    Generate spatially structured holdout masks that mimic real cloud gaps.
+
+    Instead of scattering random pixels (which trains the model on noise it
+    will never see at inference), this generates random elliptical "cloud
+    patches" over observed ocean pixels. The model must reconstruct
+    contiguous missing regions — matching real satellite cloud shadows.
+
+    Args:
+        obs_mask:     (B, T, H, W)  1 = valid observed pixel
+        target_frac:  Target fraction of valid pixels to hold out (~0.30)
+        min_radius:   Minimum ellipse semi-axis (pixels)
+        max_radius:   Maximum ellipse semi-axis (pixels)
+        max_gaps:     Maximum number of elliptical gaps per sample
+
+    Returns:
+        holdout: (B, T, H, W)  1 = held-out pixel (subset of obs_mask)
+    """
+    B, T, H, W = obs_mask.shape
+    device = obs_mask.device
+
+    # Pre-compute coordinate grids (shared across batch)
+    yy = torch.arange(H, device=device, dtype=torch.float32).view(H, 1)
+    xx = torch.arange(W, device=device, dtype=torch.float32).view(1, W)
+
+    holdout = torch.zeros_like(obs_mask)
+
+    for b in range(B):
+        # Determine number of gaps and their geometry (random per sample)
+        n_gaps = torch.randint(3, max_gaps + 1, (1,)).item()
+
+        # Random ellipse centers (anywhere in the spatial domain)
+        cy = torch.randint(0, H, (n_gaps,), device=device).float()
+        cx = torch.randint(0, W, (n_gaps,), device=device).float()
+
+        # Random semi-axes
+        ry = torch.randint(min_radius, max_radius + 1, (n_gaps,), device=device).float()
+        rx = torch.randint(min_radius, max_radius + 1, (n_gaps,), device=device).float()
+
+        # Random rotation angle per ellipse (radians)
+        theta = torch.rand(n_gaps, device=device) * 3.14159
+
+        # Build composite gap mask (H, W)
+        gap_mask = torch.zeros(H, W, device=device)
+        for g in range(n_gaps):
+            # Rotated ellipse: ((y'-cy)*cos + (x'-cx)*sin)^2/ry^2
+            #                 + (-(y'-cy)*sin + (x'-cx)*cos)^2/rx^2 < 1
+            dy = yy - cy[g]
+            dx = xx - cx[g]
+            c, s = theta[g].cos(), theta[g].sin()
+            u = (dy * c + dx * s) / ry[g]
+            v = (-dy * s + dx * c) / rx[g]
+            ellipse = (u.pow(2) + v.pow(2)) < 1.0
+            gap_mask = gap_mask.clamp(max=1.0) + ellipse.float()
+
+        gap_mask = (gap_mask > 0).float()  # union of all ellipses
+
+        # Apply to all timesteps, only where pixels are observed
+        # Each timestep gets the same spatial gap pattern (clouds persist)
+        for t in range(T):
+            holdout[b, t] = gap_mask * (obs_mask[b, t] > 0.5).float()
+
+        # Scale: if we overshot target_frac, randomly remove some gaps.
+        # If we undershot, that's fine — variable gap fraction is realistic.
+        valid_count = (obs_mask[b] > 0.5).float().sum()
+        held_count = holdout[b].sum()
+        if valid_count > 0:
+            actual_frac = held_count / valid_count
+            if actual_frac > target_frac * 1.5:
+                # Randomly keep only a subset of gaps to bring fraction down
+                keep_prob = target_frac / actual_frac.clamp(min=1e-6)
+                # Per-gap keep/drop (not per-pixel, to maintain structure)
+                gap_keep = torch.rand(n_gaps, device=device) < keep_prob
+                gap_mask_trimmed = torch.zeros(H, W, device=device)
+                for g in range(n_gaps):
+                    if gap_keep[g]:
+                        dy = yy - cy[g]
+                        dx = xx - cx[g]
+                        c, s = theta[g].cos(), theta[g].sin()
+                        u = (dy * c + dx * s) / ry[g]
+                        v = (-dy * s + dx * c) / rx[g]
+                        ellipse = (u.pow(2) + v.pow(2)) < 1.0
+                        gap_mask_trimmed = gap_mask_trimmed + ellipse.float()
+                gap_mask_trimmed = (gap_mask_trimmed > 0).float()
+                for t in range(T):
+                    holdout[b, t] = gap_mask_trimmed * (obs_mask[b, t] > 0.5).float()
+
+    return holdout
+
+
+# ======================================================================
 # Top-level model
 # ======================================================================
 
@@ -452,7 +553,8 @@ class MARASSModel(nn.Module):
     - ReconHead: mask-conditioned spatial head with skip + dilated convs
     - Temporal: returns full sequence; recon uses temporal cross-attention
     - ForecastHead: parallel + autoregressive GRU refinement
-    - ERIHead: concatenates bloom count as extra input channel
+    - ERIHead: predicts from learned features only (v3.1: no bloom_count)
+    - Holdout: structured cloud gap simulation (v3.1: no random scatter)
     """
 
     def __init__(self, cfg: ModelConfig | None = None) -> None:
@@ -511,9 +613,9 @@ class MARASSModel(nn.Module):
 
         holdout_mask = None
         if self.training and cfg.holdout_frac > 0:
-            seq_holdout_mask = (
-                (obs_mask > 0.5) & (torch.rand_like(obs_mask) < cfg.holdout_frac)
-            ).float()
+            seq_holdout_mask = _generate_structured_holdout(
+                obs_mask, target_frac=cfg.holdout_frac,
+            )
             optical = optical.clone()
             keep_mask = 1.0 - seq_holdout_mask
             optical[:, :, 0] = optical[:, :, 0] * keep_mask
@@ -556,9 +658,8 @@ class MARASSModel(nn.Module):
         opt_skip = opt_feat[:, -1] * obs_mask_last.unsqueeze(1)
         recon = self.recon_head(decoded, opt_skip, obs_mask_last)
 
-        # [FIX D] ERI with bloom count
-        bloom_count = bloom_mask.sum(dim=1)   # (B, H, W) values 0-10
-        eri = self.eri_head(decoded, bloom_count)
+        # [FIX D v3.1] ERI from learned features only (no bloom_count leakage)
+        eri = self.eri_head(decoded)
 
         outputs = {
             "recon":          recon,
