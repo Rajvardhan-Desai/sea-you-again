@@ -841,9 +841,9 @@ def evaluate(args: argparse.Namespace) -> None:
             bloom_mask = batch["bloom_mask"]
 
             # --- Gap bias correction (calibrated on val set) ---
-            # The model systematically over-predicts in gap regions by ~0.1684.
+            # The model systematically over-predicts in gap regions by ~0.3860.
             # Correct by subtracting the bias magnitude from gap pixels only.
-            GAP_BIAS = 0.1684
+            GAP_BIAS = 0.3860
             ocean = 1.0 - land_mask
             gap_mask = (1.0 - obs_mask_t) * ocean       # (B, H, W)
             recon_corrected = outputs["recon"].clone()
