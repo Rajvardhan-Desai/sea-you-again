@@ -6,7 +6,9 @@ MM-MARAS is a deep learning system for Bay of Bengal chlorophyll-a (Chl-a) recon
 
 The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~42.5M parameters) that consumes those patches.
 
-## Results (v2)
+## Results (v2 checkpoint)
+
+The model code is v3 (see Architecture — v3 fixes below). These results are from the last trained checkpoint; re-training with the v3 architecture is in progress.
 
 Trained on 1,264 patches from the Bay of Bengal (2021-2024), evaluated on 260 test patches (2024-2025). Training used 2x T4 GPUs with DDP, AMP, batch size 4 per GPU. Phase 1: 60 epochs at lr=1e-4; Phase 2: 25 epochs at lr=5e-5. Total training time ~7.5 hours.
 
@@ -93,6 +95,12 @@ discharge                        --> DischargeEncoder  (Swin-UNet, 2ch)  --/
 **Decoder.** Four expert ConvNets soft-blended per sample via global routing (average pool, MLP, softmax). Load-balancing auxiliary loss at weight 0.01.
 
 **Heads.** Reconstruction (1x1 conv), forecast (shared 2-layer trunk + per-step projections), uncertainty (1x1 conv), ERI ordinal logits (1x1 conv), bloom forecast (shared trunk + per-step binary outputs). Total: ~42.5M parameters.
+
+**v3 architectural fixes (current code).** Four targeted improvements over the v2 training run:
+- [A] ReconHead: dilated 3×3/5×5 convolutions conditioned on `obs_mask`; skip connection from optical encoder → improves gap RMSE/SSIM.
+- [B] Temporal attention in ReconHead: cross-attends to the full ConvLSTM hidden sequence → recovers information from earlier timesteps for gap pixels.
+- [C] Autoregressive forecast refinement: lightweight GRU refines each forecast step conditioned on the previous prediction → fixes SSIM non-monotonicity at longer horizons.
+- [D] ERI head receives `bloom_mask.sum(dim=1)` directly as an extra input channel → improves ERI class 1 F1.
 
 ## Repository layout
 
