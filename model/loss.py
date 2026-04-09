@@ -312,21 +312,29 @@ def bloom_forecast_loss(
     pos_weight_value: float = 20.0,
 ) -> Tensor:
     """
-    Binary cross-entropy loss for bloom prediction at each forecast step.
+    Binary cross-entropy loss for elevated Chl-a prediction at each forecast step.
 
-    Targets are derived from target_chl: a pixel is "bloom" if its
-    normalized Chl-a exceeds bloom_threshold at that forecast step.
+    Targets are derived from target_chl: a pixel is "elevated" if its
+    z-scored Chl-a exceeds bloom_threshold at that forecast step.
+    With the default threshold=2.5, this detects anomalously high Chl-a
+    (≈0.94 mg/m³ raw), not true algal blooms (≥10 mg/m³).
 
     Args:
         logits:         (B, H_fcast, H, W)  raw logits from BloomForecastHead
         target_chl:     (B, H_fcast, H, W)  future Chl-a (normalized)
         target_mask:    (B, H_fcast, H, W)  1 = valid supervisable pixel
         land_mask:      (B, H, W)           1 = land
-        bloom_threshold: threshold on normalized Chl-a for bloom detection.
-                        This should be set from norm_stats:
-                        threshold = (log1p(10.0) - chl_mean) / chl_std
-                        where 10.0 mg/m³ is the raw bloom threshold.
-        pos_weight_value: positive class weight for BCE. Blooms are rare
+        bloom_threshold: threshold on z-scored Chl-a for "elevated" detection.
+                        Train.py passes 2.5, which in z-score space corresponds
+                        to raw Chl-a ≈ exp(2.5*0.2077 + 0.1450) - 1 ≈ 0.94 mg/m³.
+                        This predicts "elevated Chl-a anomalies" (top ~0.6% of
+                        pixels), NOT true algal blooms (≥10 mg/m³). The true
+                        bloom threshold in z-score space would be
+                        (log1p(10.0) - 0.1450) / 0.2077 ≈ 10.85, which produces
+                        near-zero positives and is impractical for training.
+                        NOTE: This is intentionally different from bloom_mask
+                        (masker.py, raw 10 mg/m³) used for ERI supervision.
+        pos_weight_value: positive class weight for BCE. Elevated events are rare
                          (~0.5% of pixels), so we upweight positives heavily.
 
     Returns:
