@@ -546,12 +546,14 @@ class MARASSModel(nn.Module):
         # --- Heads ---
 
         # [FIX A] ReconHead: mask-aware with optical skip
-        opt_skip = opt_feat[:, -1]   # last timestep optical features
         obs_mask_last = obs_mask[:, -1]
         if holdout_mask is not None:
             # During training, the obs_mask was zeroed at holdout positions
             # Pass the modified mask so the head knows about holdouts too
             obs_mask_last = obs_mask_last * (1.0 - holdout_mask)
+        # [v3] Gate skip by obs_mask — prevent bad encoder features at gap
+        # pixels from leaking through the skip connection
+        opt_skip = opt_feat[:, -1] * obs_mask_last.unsqueeze(1)
         recon = self.recon_head(decoded, opt_skip, obs_mask_last)
 
         # [FIX D] ERI with bloom count
