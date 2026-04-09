@@ -444,12 +444,13 @@ class TemporalModuleV3(nn.Module):
 # [v3.1] Structured holdout — synthetic cloud gap generation
 # ======================================================================
 
+@torch.no_grad()
 def _generate_structured_holdout(
     obs_mask: Tensor,
     target_frac: float = 0.30,
     min_radius: int = 3,
-    max_radius: int = 15,
-    max_gaps: int = 12,
+    max_radius: int = 10,
+    max_gaps: int = 6,
 ) -> Tensor:
     """
     Generate spatially structured holdout masks that mimic real cloud gaps.
@@ -479,64 +480,52 @@ def _generate_structured_holdout(
     holdout = torch.zeros_like(obs_mask)
 
     for b in range(B):
-        # Determine number of gaps and their geometry (random per sample)
-        n_gaps = torch.randint(3, max_gaps + 1, (1,)).item()
+        n_gaps = torch.randint(2, max_gaps + 1, (1,)).item()
 
-        # Random ellipse centers (anywhere in the spatial domain)
         cy = torch.randint(0, H, (n_gaps,), device=device).float()
         cx = torch.randint(0, W, (n_gaps,), device=device).float()
-
-        # Random semi-axes
         ry = torch.randint(min_radius, max_radius + 1, (n_gaps,), device=device).float()
         rx = torch.randint(min_radius, max_radius + 1, (n_gaps,), device=device).float()
-
-        # Random rotation angle per ellipse (radians)
         theta = torch.rand(n_gaps, device=device) * 3.14159
 
-        # Build composite gap mask (H, W)
-        gap_mask = torch.zeros(H, W, device=device)
-        for g in range(n_gaps):
-            # Rotated ellipse: ((y'-cy)*cos + (x'-cx)*sin)^2/ry^2
-            #                 + (-(y'-cy)*sin + (x'-cx)*cos)^2/rx^2 < 1
-            dy = yy - cy[g]
-            dx = xx - cx[g]
-            c, s = theta[g].cos(), theta[g].sin()
-            u = (dy * c + dx * s) / ry[g]
-            v = (-dy * s + dx * c) / rx[g]
-            ellipse = (u.pow(2) + v.pow(2)) < 1.0
-            gap_mask = gap_mask.clamp(max=1.0) + ellipse.float()
-
-        gap_mask = (gap_mask > 0).float()  # union of all ellipses
+        # Build composite gap mask (H, W) — vectorized over gaps
+        # Expand grids: (n_gaps, H, W)
+        dy = yy.unsqueeze(0) - cy.view(-1, 1, 1)   # (G, H, W)
+        dx = xx.unsqueeze(0) - cx.view(-1, 1, 1)   # (G, H, W)
+        c = theta.cos().view(-1, 1, 1)
+        s = theta.sin().view(-1, 1, 1)
+        u = (dy * c + dx * s) / ry.view(-1, 1, 1)
+        v = (-dy * s + dx * c) / rx.view(-1, 1, 1)
+        ellipses = (u.pow(2) + v.pow(2)) < 1.0     # (G, H, W)
+        gap_mask = ellipses.any(dim=0).float()      # (H, W)
 
         # Apply to all timesteps, only where pixels are observed
-        # Each timestep gets the same spatial gap pattern (clouds persist)
-        for t in range(T):
-            holdout[b, t] = gap_mask * (obs_mask[b, t] > 0.5).float()
+        obs_b = (obs_mask[b] > 0.5).float()         # (T, H, W)
+        sample_holdout = gap_mask.unsqueeze(0) * obs_b  # (T, H, W)
 
-        # Scale: if we overshot target_frac, randomly remove some gaps.
-        # If we undershot, that's fine — variable gap fraction is realistic.
-        valid_count = (obs_mask[b] > 0.5).float().sum()
-        held_count = holdout[b].sum()
+        # Hard cap: if holdout exceeds target_frac, randomly drop whole
+        # ellipses until we're under budget. This prevents pathological
+        # batches with 50-70% holdout that cause gradient explosion.
+        valid_count = obs_b.sum()
         if valid_count > 0:
+            held_count = sample_holdout.sum()
             actual_frac = held_count / valid_count
-            if actual_frac > target_frac * 1.5:
-                # Randomly keep only a subset of gaps to bring fraction down
-                keep_prob = target_frac / actual_frac.clamp(min=1e-6)
-                # Per-gap keep/drop (not per-pixel, to maintain structure)
-                gap_keep = torch.rand(n_gaps, device=device) < keep_prob
-                gap_mask_trimmed = torch.zeros(H, W, device=device)
-                for g in range(n_gaps):
-                    if gap_keep[g]:
-                        dy = yy - cy[g]
-                        dx = xx - cx[g]
-                        c, s = theta[g].cos(), theta[g].sin()
-                        u = (dy * c + dx * s) / ry[g]
-                        v = (-dy * s + dx * c) / rx[g]
-                        ellipse = (u.pow(2) + v.pow(2)) < 1.0
-                        gap_mask_trimmed = gap_mask_trimmed + ellipse.float()
-                gap_mask_trimmed = (gap_mask_trimmed > 0).float()
-                for t in range(T):
-                    holdout[b, t] = gap_mask_trimmed * (obs_mask[b, t] > 0.5).float()
+            if actual_frac > target_frac * 1.2:
+                # Drop ellipses one at a time (largest first via random perm)
+                perm = torch.randperm(n_gaps, device=device)
+                trimmed = ellipses.clone()
+                for idx in perm:
+                    trimmed[idx] = False
+                    new_mask = trimmed.any(dim=0).float()
+                    new_holdout = new_mask.unsqueeze(0) * obs_b
+                    new_frac = new_holdout.sum() / valid_count
+                    if new_frac <= target_frac:
+                        sample_holdout = new_holdout
+                        break
+                else:
+                    sample_holdout = trimmed.any(dim=0).float().unsqueeze(0) * obs_b
+
+        holdout[b] = sample_holdout
 
     return holdout
 
