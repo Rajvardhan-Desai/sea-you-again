@@ -481,9 +481,10 @@ class OpticalEncoder(nn.Module):
         Input:  (B, T, C, H, W)
         Output: (B, T, embed_dim, H, W)
         """
+        from torch.utils.checkpoint import checkpoint as ckpt
         B, T, C, H, W = optical.shape
         x = optical.view(B * T, C, H, W)
-        x = self.forward_single(x)              # (B*T, embed_dim, H, W)
+        x = ckpt(self.forward_single, x, use_reentrant=False)
         return x.view(B, T, self.embed_dim, H, W)
 
     def load_satmae_patch_embed(self, satmae_ckpt_path: str) -> None:
