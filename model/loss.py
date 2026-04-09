@@ -1,5 +1,11 @@
 """
-loss.py — MM-MARAS loss functions (v2)
+loss.py — MM-MARAS loss functions (v3)
+
+Changes from v2:
+    [v3] holdout_recon_loss: Laplacian weight 0.02 → 0.05, added L1 bias term
+    [v3] forecast_loss: added differentiable SSIM component (weight 0.2)
+    [v3] eri_loss: class 1 weight 10.0 → 15.0 for better rare-class F1
+    [v3] LossWeights: holdout weight 0.5 → 0.8 for stronger gap supervision
 
 Changes from v1:
     [PERF 3] aux weight 0.001 → 0.01 — expert 0 was nearly dead at 5.3%
@@ -11,8 +17,8 @@ Changes from v1:
 
 Loss summary:
     recon_loss          Heteroscedastic NLL over observed ocean pixels
-    holdout_recon_loss  Heteroscedastic NLL + SSIM on held-out pixels [PERF 4]
-    forecast_loss       Masked Huber (smooth-L1) over target_mask * (1 - land_mask)
+    holdout_recon_loss  Heteroscedastic NLL + Laplacian + L1 bias on held-out pixels
+    forecast_loss       Masked Huber + SSIM over target_mask * (1 - land_mask)
     eri_loss            Ordinal cross-entropy via cumulative link model
     bloom_forecast_loss Binary CE for bloom prediction at each forecast step [FEAT 1]
     aux_loss            MoE load-balancing (from moe_decoder.py)
@@ -33,7 +39,7 @@ Default weights:
     w_eri         = 0.3
     w_bloom_fcast = 0.3    [FEAT 1] new
     w_aux         = 0.01   [PERF 3] was 0.001
-    w_holdout     = 0.5
+    w_holdout     = 0.8    [v3] was 0.5
 """
 
 from __future__ import annotations
@@ -46,6 +52,34 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from moe_decoder import compute_aux_loss
+
+
+# ======================================================================
+# [v3] Differentiable SSIM helpers
+# ======================================================================
+
+def _gaussian_window(size: int = 7, sigma: float = 1.5) -> Tensor:
+    """2D Gaussian window for SSIM computation."""
+    coords = torch.arange(size, dtype=torch.float32) - size // 2
+    g = (-coords.pow(2) / (2 * sigma ** 2)).exp()
+    g = g / g.sum()
+    return g.outer(g).unsqueeze(0).unsqueeze(0)          # (1, 1, size, size)
+
+
+def _ssim_map(
+    x: Tensor, y: Tensor, window: Tensor,
+    C1: float = 0.01 ** 2, C2: float = 0.03 ** 2,
+) -> Tensor:
+    """Per-pixel SSIM between (B, 1, H, W) tensors."""
+    pad = window.shape[-1] // 2
+    mu_x  = F.conv2d(x, window, padding=pad)
+    mu_y  = F.conv2d(y, window, padding=pad)
+    s_xx  = F.conv2d(x * x, window, padding=pad) - mu_x.pow(2)
+    s_yy  = F.conv2d(y * y, window, padding=pad) - mu_y.pow(2)
+    s_xy  = F.conv2d(x * y, window, padding=pad) - mu_x * mu_y
+    num   = (2 * mu_x * mu_y + C1) * (2 * s_xy + C2)
+    den   = (mu_x.pow(2) + mu_y.pow(2) + C1) * (s_xx + s_yy + C2)
+    return num / den                                      # (B, 1, H, W)
 
 
 # ======================================================================
@@ -144,9 +178,14 @@ def holdout_recon_loss(
     grad_diff = (pred_lap - target_lap).pow(2)
     grad_loss = (grad_diff * sup_mask).sum() / n_valid
 
-    # Weight the gradient term low to avoid gradient explosion through
-    # ReconHead's dilated conv stack (was 0.1, caused NaN at epoch 73)
-    return nll_loss + 0.02 * grad_loss
+    # [v3] L1 bias penalty — directly penalizes systematic over/under-prediction
+    # on gap pixels (attacks the GAP_BIAS issue at the source)
+    bias = ((pred_sq - target_f) * sup_mask).sum() / n_valid
+    bias_loss = bias.abs()
+
+    # [v3] Laplacian weight raised from 0.02 → 0.05 (stable with grad clip 1.0)
+    # Was 0.1 in early v2, caused NaN at epoch 73; 0.05 is the safe middle ground
+    return nll_loss + 0.05 * grad_loss + 0.1 * bias_loss
 
 
 # ======================================================================
@@ -159,16 +198,35 @@ def forecast_loss(
     target_mask: Tensor,
     land_mask: Tensor,
     delta: float = 0.5,
+    ssim_weight: float = 0.2,
 ) -> Tensor:
     """
-    Masked Huber (smooth-L1) loss for Chl-a forecasting.
+    Masked Huber (smooth-L1) + SSIM loss for Chl-a forecasting.
+
+    [v3] Added differentiable SSIM component to improve structural
+    similarity of forecast maps. Weight 0.2 by default.
     """
     ocean = (1.0 - land_mask).unsqueeze(1)
     valid = target_mask * ocean
 
     huber = F.huber_loss(pred, target, reduction="none", delta=delta)
     n_valid = valid.sum().clamp(min=1.0)
-    return (huber * valid).sum() / n_valid
+    l_huber = (huber * valid).sum() / n_valid
+
+    # [v3] SSIM component — per-step, averaged
+    if ssim_weight > 0.0:
+        window = _gaussian_window(7, 1.5).to(pred.device, pred.dtype)
+        B, S, H, W = pred.shape
+        ssim_total = 0.0
+        for s in range(S):
+            p = (pred[:, s:s+1] * valid[:, s:s+1]).float()
+            t = (target[:, s:s+1] * valid[:, s:s+1]).float()
+            smap = _ssim_map(p, t, window)
+            ssim_total = ssim_total + (1.0 - smap).mean()
+        l_ssim = ssim_total / S
+        return l_huber + ssim_weight * l_ssim
+
+    return l_huber
 
 
 # ======================================================================
@@ -195,9 +253,9 @@ def eri_loss(
     target_long = target.long().clamp(0, n_levels - 1)
     nll = F.nll_loss(log_probs, target_long, reduction="none")
 
-    # Increased class 1 weight from 5.0 to 10.0 to handle 0.03% imbalance
+    # [v3] class 1 weight 10.0 → 15.0 (was 5.0 in v1) for 0.03% imbalance
     class_weights = torch.tensor(
-        [0.15, 10.0, 4.0, 4.0, 5.0], device=logits.device
+        [0.15, 15.0, 4.0, 4.0, 5.0], device=logits.device
     )
     sample_weight = class_weights[target_long]
 
@@ -323,17 +381,18 @@ class LossWeights:
     eri:         float = 0.3
     bloom_fcast: float = 0.3    # [FEAT 1] bloom lead-time prediction
     aux:         float = 0.01   # [PERF 3] was 0.001 — fix expert collapse
-    holdout:     float = 0.5
+    holdout:     float = 0.8    # [v3] was 0.5 — stronger gap supervision
 
 
 class MARASSLoss(nn.Module):
     """
-    Combined MM-MARAS training loss (v2).
+    Combined MM-MARAS training loss (v3).
 
-    Changes from v1:
-        - bloom_fcast loss term added (binary CE, curriculum-ramped)
-        - aux weight increased from 0.001 to 0.01
-        - holdout loss includes spatial gradient matching
+    Changes from v2:
+        - holdout loss: Laplacian weight 0.02→0.05, added L1 bias term
+        - forecast loss: added SSIM component (weight 0.2)
+        - ERI: class 1 weight 10→15
+        - holdout weight 0.5→0.8
     """
 
     def __init__(

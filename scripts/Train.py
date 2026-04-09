@@ -109,10 +109,12 @@ def _build_ddp_loaders(
     num_workers: int,
     rank: int,
     world_size: int,
+    bloom_oversample: int = 1,
 ) -> dict[str, DataLoader]:
     loaders = {}
     for split in ("train", "val", "test"):
-        dataset = MARASSDataset(patch_dir=patch_dir, split=split)
+        dataset = MARASSDataset(patch_dir=patch_dir, split=split,
+                                bloom_oversample=bloom_oversample)
         if split == "train":
             sampler = DistributedSampler(
                 dataset,
@@ -156,9 +158,11 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-forecast", type=float, default=0.5)
     p.add_argument("--w-eri",      type=float, default=0.3)
     p.add_argument("--w-aux",      type=float, default=0.01)
-    p.add_argument("--w-holdout",  type=float, default=0.5)
+    p.add_argument("--w-holdout",  type=float, default=0.8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None)
+    p.add_argument("--bloom-oversample", type=int, default=3,
+                   help="[v3] Duplicate bloom patches N× in training set (default 3)")
     p.add_argument("--device", default=None)
     return p.parse_args()
 
@@ -509,6 +513,7 @@ def main() -> None:
             num_workers=args.num_workers,
             rank=local_rank,
             world_size=world_size,
+            bloom_oversample=args.bloom_oversample,
         )
         steps_per_epoch = len(loaders["train"])
         total_steps  = steps_per_epoch * args.epochs
@@ -519,6 +524,7 @@ def main() -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
+            bloom_oversample=args.bloom_oversample,
         )
         steps_per_epoch = len(loaders["train"])
         total_steps     = steps_per_epoch * args.epochs

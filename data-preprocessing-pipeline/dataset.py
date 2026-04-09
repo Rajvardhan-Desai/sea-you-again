@@ -102,12 +102,15 @@ class MARASSDataset(Dataset):
     PyTorch Dataset for MM-MARAS .npz patch files.
 
     Args:
-        patch_dir : Root of the patches directory (data/patches/).
-        split     : One of "train", "val", "test".
-        validate  : If True, shape-check every patch on first access.
-        nan_fill  : Fill value for missing Chl-a pixels in chl_obs.
-                    The obs_mask already encodes which pixels were originally
-                    missing so the model can learn to ignore this value.
+        patch_dir        : Root of the patches directory (data/patches/).
+        split            : One of "train", "val", "test".
+        validate         : If True, shape-check every patch on first access.
+        nan_fill         : Fill value for missing Chl-a pixels in chl_obs.
+                           The obs_mask already encodes which pixels were originally
+                           missing so the model can learn to ignore this value.
+        bloom_oversample : [v3] Duplicate bloom-containing patches this many times
+                           in the training set (e.g., 3 = each bloom patch appears
+                           3× total). Only applies to the "train" split.
     """
 
     def __init__(
@@ -116,6 +119,7 @@ class MARASSDataset(Dataset):
         split: SPLIT,
         validate: bool = True,
         nan_fill: float = 0.0,
+        bloom_oversample: int = 1,
     ) -> None:
         self.split    = split
         self.validate = validate
@@ -129,13 +133,31 @@ class MARASSDataset(Dataset):
         if not self.files:
             raise RuntimeError(f"No .npz files found in {split_dir}")
 
-        log.info(f"[{split}] Loaded {len(self.files)} patches from {split_dir}")
+        # [v3] Bloom oversampling: duplicate bloom-containing patches
+        # so the model sees rare bloom examples more often during training
+        self._indices = list(range(len(self.files)))
+        if bloom_oversample > 1 and split == "train":
+            bloom_indices = []
+            for i, f in enumerate(self.files):
+                data = np.load(f, allow_pickle=False)
+                if data["bloom_mask"].any():
+                    bloom_indices.append(i)
+                data.close()
+            for _ in range(bloom_oversample - 1):
+                self._indices.extend(bloom_indices)
+            log.info(
+                f"[{split}] Bloom oversample {bloom_oversample}x: "
+                f"{len(bloom_indices)} bloom patches → "
+                f"{len(self._indices)} total samples (was {len(self.files)})"
+            )
+        else:
+            log.info(f"[{split}] Loaded {len(self.files)} patches from {split_dir}")
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self._indices)
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
-        path = self.files[idx]
+        path = self.files[self._indices[idx]]
 
         try:
             data = np.load(path, allow_pickle=False)
@@ -191,6 +213,7 @@ class MARASSDataset(Dataset):
         return (
             f"MARASSDataset(split={self.split!r}, "
             f"n_patches={len(self.files)}, "
+            f"n_samples={len(self._indices)}, "
             f"validate={self.validate})"
         )
 
@@ -219,17 +242,19 @@ def build_dataloaders(
     pin_memory: bool = True,
     validate: bool = True,
     nan_fill: float = 0.0,
+    bloom_oversample: int = 1,
 ) -> dict[SPLIT, DataLoader]:
     """
     Build train / val / test DataLoaders.
 
     Args:
-        patch_dir   : Root patches directory (data/patches/).
-        batch_size  : Samples per batch.
-        num_workers : Parallel workers (0 for Windows debugging).
-        pin_memory  : Speeds up CPU → GPU transfers (disable on CPU-only).
-        validate    : Shape-check patches on load.
-        nan_fill    : Fill value for missing Chl-a pixels.
+        patch_dir        : Root patches directory (data/patches/).
+        batch_size       : Samples per batch.
+        num_workers      : Parallel workers (0 for Windows debugging).
+        pin_memory       : Speeds up CPU → GPU transfers (disable on CPU-only).
+        validate         : Shape-check patches on load.
+        nan_fill         : Fill value for missing Chl-a pixels.
+        bloom_oversample : [v3] Oversample bloom patches N× in training set.
 
     Returns:
         Dict with keys "train", "val", "test".
@@ -239,10 +264,11 @@ def build_dataloaders(
 
     for split in ("train", "val", "test"):
         ds = MARASSDataset(
-            patch_dir = patch_dir,
-            split     = split,      # type: ignore[arg-type]
-            validate  = validate,
-            nan_fill  = nan_fill,
+            patch_dir        = patch_dir,
+            split            = split,      # type: ignore[arg-type]
+            validate         = validate,
+            nan_fill         = nan_fill,
+            bloom_oversample = bloom_oversample,
         )
         loaders[split] = DataLoader(
             ds,
