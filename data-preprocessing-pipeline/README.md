@@ -103,7 +103,7 @@ GEBCO (bathymetry)       ─┘
 | Dataset | `cems-glofas-historical` |
 | Source | Copernicus Emergency Management Service (CEMS) |
 | Resolution | 0.05°, daily |
-| Variables | `dis24`, `ro`, `swvl` |
+| Variables | `dis24`, `rowe` |
 | Format | NetCDF-4 |
 
 ### 5. Bathymetry
@@ -295,18 +295,18 @@ python data-preprocessing-pipeline/pipeline.py --bathy data-preprocessing-pipeli
 | `mnar_mask` | `(T=10, H=64, W=64)` | 1 = MNAR missing pixel |
 | `physics` | `(T=10, C=6, H=64, W=64)` | thetao, uo, vo, mlotst, zos, so |
 | `wind` | `(T=10, C=4, H=64, W=64)` | u10, v10, msl, tp |
-| `discharge` | `(T=10, C=3, H=64, W=64)` | dis24, ro, swvl |
+| `discharge` | `(T=10, C=2, H=64, W=64)` | dis24, rowe |
 | `bgc_aux` | `(T=10, C=5, H=64, W=64)` | o2, no3, po4, si, nppv |
 | `static` | `(C=2, H=64, W=64)` | bathymetry, distance-to-coast |
 | `bloom_mask` | `(T=10, H=64, W=64)` | 1 = bloom event (ERI supervision) |
-| `target_chl` | `(H=5, H=64, W=64)` | Future Chl-a (forecast target) |
+| `target_chl` | `(T=5, H=64, W=64)` | Future Chl-a (forecast target) |
 
 **Derived at load time (not stored on disk):**
 
 | Key | Shape | Description |
 |---|---|---|
 | `land_mask` | `(H=64, W=64)` | 1 = land pixel |
-| `target_mask` | `(H=5, H=64, W=64)` | 1 = valid supervisable ocean pixel |
+| `target_mask` | `(T=5, H=64, W=64)` | 1 = valid supervisable ocean pixel |
 
 ### Temporal split
 
@@ -379,7 +379,7 @@ Expected output:
   mnar_mask      (4, 10, 64, 64)          dtype=torch.float32
   physics        (4, 10, 6, 64, 64)       dtype=torch.float32
   wind           (4, 10, 4, 64, 64)       dtype=torch.float32
-  discharge      (4, 10, 3, 64, 64)       dtype=torch.float32
+  discharge      (4, 10, 2, 64, 64)       dtype=torch.float32
   bgc_aux        (4, 10, 5, 64, 64)       dtype=torch.float32
   static         (4, 2, 64, 64)           dtype=torch.float32
   bloom_mask     (4, 10, 64, 64)          dtype=torch.float32
