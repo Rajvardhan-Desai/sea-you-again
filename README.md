@@ -4,7 +4,7 @@
 
 MM-MARAS is a deep learning system for Bay of Bengal chlorophyll-a (Chl-a) reconstruction, 5-step forecasting, pixel-level uncertainty estimation, algal bloom early warning, and ecosystem risk assessment. It fuses five heterogeneous input streams through a Perceiver IO cross-attention module, processes the temporal sequence with a two-layer ConvLSTM, and decodes through a soft-routing Mixture-of-Experts decoder.
 
-The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~42.5M parameters) that consumes those patches.
+The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~44.4M parameters) that consumes those patches.
 
 ## Results (v2)
 
@@ -58,6 +58,37 @@ Expert utilization: 1.000 (perfect). Routing entropy: 1.386 / 1.386 (maximum). A
 | Expert utilization | 0.849 | **1.000** | +18% |
 | Expert 0 weight | 5.3% | **24.8%** | fixed |
 
+## Results (v3)
+
+Trained on the same 1,264 / 260 / 260 patch split. Phase 1: 50 epochs at lr=1e-4; Phase 2 (fine-tune): 30 epochs (50-79) at lr=3e-5. Best checkpoint at epoch 58 (val loss -2.6229). Peak VRAM: ~7.1 GB per T4 GPU with AMP and gradient checkpointing. Post-hoc calibration applied (GAP_BIAS=0.3860, bloom threshold=0.90).
+
+### Headline metrics
+
+| Metric | Value |
+|---|---|
+| Valid RMSE | 0.0716 |
+| Valid R² | 0.9761 |
+| Valid SSIM | 0.9741 |
+| Forecast t+1 RMSE | 0.1180 |
+| Forecast t+1 SSIM | 0.8834 |
+| Bloom Macro F1 | 0.8098 |
+| ERI Macro F1 | 0.8840 |
+| ECE | 0.0005 |
+| MoE Utilisation | 1.0000 |
+
+### v2 to v3 comparison
+
+| Metric | v2 | v3 | Change |
+|---|---|---|---|
+| Valid RMSE | 0.1018 | **0.0716** | -30% |
+| Valid R² | 0.952 | **0.9761** | +3% |
+| Valid SSIM | 0.927 | **0.9741** | +5% |
+| Forecast +1 RMSE | 0.1315 | **0.1180** | -10% |
+| Forecast +1 SSIM | 0.889 | 0.8834 | -1% |
+| ERI Macro F1 | 0.687 | **0.8840** | +29% |
+| ECE | 0.0002 | 0.0005 | +150% |
+| Expert utilisation | 1.000 | 1.0000 | -- |
+
 ## Model outputs
 
 Given a temporal patch of 10 satellite and environmental time steps, the model predicts:
@@ -77,22 +108,22 @@ Additionally, `compute_ecosystem_impact()` derives a per-pixel 0-1 ecosystem imp
 ## Architecture
 
 ```
-optical (chl_obs + obs_mask)      --> OpticalEncoder   (Swin-UNet, 2ch)  --\
-physics + wind + static          --> PhysicsEncoder    (Swin-UNet, 12ch) --\
-masks (obs/mcar/mnar/bloom)      --> MaskNet           (GNN + temporal)  --> FusionModule --> TemporalModule --> MoEDecoder --> Heads
-bgc_aux                          --> BGCAuxEncoder     (Swin-UNet, 5ch)  --/   (Perceiver IO)  (ConvLSTM x2)    (4 experts)
+optical (chl_obs + obs_mask)      --> OpticalEncoder   (Swin-UNet, 2ch)  --\                                          skip to ReconHead
+physics + wind + static          --> PhysicsEncoder    (Swin-UNet, 12ch) --\                                               |
+masks (obs/mcar/mnar/bloom)      --> MaskNet           (GNN + temporal)  --> FusionModule --> TemporalModuleV3 --> TemporalReconAttn --> MoEDecoder --> Heads
+bgc_aux                          --> BGCAuxEncoder     (Swin-UNet, 5ch)  --/   (Perceiver IO)  (ConvLSTM x2)      (4-head cross-attn)   (4 experts)
 discharge                        --> DischargeEncoder  (Swin-UNet, 2ch)  --/
 ```
 
-**Encoders.** All four spatial encoders reuse the same Swin-UNet backbone (patch embed, 3-stage encoder, bottleneck, 3-stage decoder with skip connections) with independent weights. Stage dimensions: 64, 128, 256; window sizes: 8, 8, 4. The physics encoder concatenates ocean state (6ch), wind/atmosphere (4ch), and static context (2ch, broadcast over time) into 12 channels. MaskNet classifies pixels into five missingness types via learned embeddings, propagates context through two rounds of masked grid-graph convolution, and mixes across time with depthwise temporal convolution.
+**Encoders.** All four spatial encoders reuse the same Swin-UNet backbone (patch embed, 3-stage encoder, bottleneck, 3-stage decoder with skip connections) with independent weights. Gradient checkpointing wraps each encoder's forward pass to trade compute for ~40% activation memory savings. Stage dimensions: 64, 128, 256; window sizes: 8, 8, 4. The physics encoder concatenates ocean state (6ch), wind/atmosphere (4ch), and static context (2ch, broadcast over time) into 12 channels. MaskNet classifies pixels into five missingness types via learned embeddings, propagates context through two rounds of masked grid-graph convolution, and mixes across time with depthwise temporal convolution.
 
 **Fusion.** Perceiver IO with 64 latent queries cross-attending to spatially pooled tokens from all five streams (1280 KV tokens). Self-attention refinement, then decode back to full resolution via position-aware spatial queries with residual blend.
 
-**Temporal.** Two stacked ConvLSTM layers. Layer 1 returns the full hidden sequence; layer 2 processes it with global-context bias. Final hidden state + sequence mean residual produces (B, D, H, W).
+**Temporal (v3).** Two stacked ConvLSTM layers with gradient checkpointing. Layer 1 returns the full hidden sequence (B, T, D, H, W); layer 2 processes it with global-context bias to produce the final state (B, D, H, W). The final state is then enriched via TemporalReconAttention: 4-head cross-attention from the last-timestep query to the full layer-1 sequence, using cosine similarity with learnable temperature, L2-normalized Q/K, and obs_mask-weighted spatial pooling. Gap pixels at the last timestep attend to previously observed timesteps to recover context lost during temporal encoding.
 
 **Decoder.** Four expert ConvNets soft-blended per sample via global routing (average pool, MLP, softmax). Load-balancing auxiliary loss at weight 0.01.
 
-**Heads.** Reconstruction (1x1 conv), forecast (shared 2-layer trunk + per-step projections), uncertainty (1x1 conv), ERI ordinal logits (1x1 conv), bloom forecast (shared trunk + per-step binary outputs). Total: ~42.5M parameters.
+**Heads (v3).** Reconstruction: mask-conditioned spatial head — fuses decoded features, optical encoder skip connection, and obs_mask (D×2+1 channels), then 3 dilated convolutions (dilation 1, 2, 4; 9×9 effective receptive field), then 1×1 projection. Forecast: two-stage — (1) parallel prediction via shared 2-layer trunk + per-step projections, then (2) autoregressive ConvGRU refinement unrolled over 5 steps (D//4 channels, corrections clamped to [-1, 1]). Uncertainty: 1×1 conv (unchanged). ERI: takes decoded features + bloom count (bloom_mask.sum(dim=1) / 10) as extra input channel; Conv2d(D+1 → D//2 → 5) with GroupNorm. Bloom forecast: shared trunk + per-step binary outputs (unchanged). Total: ~44.4M parameters.
 
 ## Repository layout
 
@@ -123,7 +154,7 @@ sea-you-again/
 │   ├── moe_decoder.py        Soft-routing Mixture-of-Experts decoder (4 experts)
 │   ├── augment.py            Spatial data augmentation (flips + 90° rotations)
 │   ├── loss.py               MARASSLoss: 6 loss terms with curriculum scheduling
-│   ├── calibrate.py          Post-hoc uncertainty calibration utilities
+│   ├── calibrate.py          Post-hoc calibration: gap bias correction + bloom threshold optimization
 │   ├── check_threshold.py    Bloom threshold utilities
 │   └── encoders/
 │       ├── optical_encoder.py    Swin-UNet backbone (shared architecture for all spatial encoders)
@@ -222,6 +253,24 @@ Random flips (horizontal p=0.5, vertical p=0.5) and 90° rotations (p=0.5) appli
 
 ### Training
 
+**v3 (current):**
+
+```bash
+# Phase 1: 50 epochs at lr=1e-4
+torchrun --nproc_per_node=2 scripts/Train.py \
+    --patch-dir data-preprocessing-pipeline/data/patches --batch-size 4 --epochs 50 --lr 1e-4 --warmup-epochs 5
+
+# Phase 2: fine-tune 30 more at lr=3e-5 (epochs 50-79, best at epoch 58)
+torchrun --nproc_per_node=2 scripts/Train.py \
+    --patch-dir data-preprocessing-pipeline/data/patches --resume checkpoints/best.pt \
+    --batch-size 4 --epochs 80 --lr 3e-5 --warmup-epochs 5
+```
+
+Peak VRAM: ~7.1 GB per T4 GPU with AMP and gradient checkpointing.
+
+<details>
+<summary>v2 training (for reference)</summary>
+
 ```bash
 # Phase 1: 60 epochs at lr=1e-4
 torchrun --nproc_per_node=2 scripts/Train.py \
@@ -234,6 +283,7 @@ torchrun --nproc_per_node=2 scripts/Train.py \
 ```
 
 Peak VRAM: ~10.6 GB per T4 GPU. ~218 seconds per epoch.
+</details>
 
 ### Evaluation
 
@@ -244,6 +294,20 @@ python scripts/eval.py --ckpt checkpoints/best.pt --patch-dir data-preprocessing
 Outputs: `metrics.json`, `confusion_matrix.csv`, `calibration.csv`, and `figures/` containing reconstruction panels, forecast panels, bloom probability + ecosystem impact maps, calibration diagram, and routing bar chart.
 
 Reported metrics: reconstruction (RMSE, MAE, bias, R², SSIM, CRPS over all/valid/gap subsets), forecast (RMSE, MAE, SSIM per horizon), ERI (accuracy, macro-F1, per-class F1, ordinal MAE), uncertainty (ECE, variance-error correlation), MoE routing (per-expert weights, entropy, utilization), bloom forecast (per-step precision, recall, F1), and ecosystem impact (mean, percentiles, high-impact fraction).
+
+### Post-hoc calibration (v3)
+
+`model/calibrate.py` computes post-training corrections applied at inference time (no retraining required):
+
+1. **Gap bias correction**: The model over-predicts on gap (cloud-masked) pixels. `calibrate.py` measures the mean bias on the validation set; `eval.py` subtracts the calibrated GAP_BIAS (0.3860) from gap pixel predictions.
+2. **Bloom threshold optimization**: The default bloom classification threshold (0.5) is replaced with a calibrated threshold of 0.90, found by sweeping thresholds to maximize F1. This trades recall for substantially improved precision.
+
+```bash
+python model/calibrate.py \
+    --ckpt checkpoints/best.pt \
+    --patch-dir data-preprocessing-pipeline/data/patches \
+    --out-dir calibration_results
+```
 
 ### Smoke tests
 
@@ -303,5 +367,6 @@ A single inference pass produces: bloom probability timeline (5 maps, one per fu
 - The optical encoder supports optional SatMAE weight initialization via `load_satmae_patch_embed()`.
 - The contrastive pre-alignment loss in `fusion.py` is available for an optional pretraining phase.
 - All pipeline downloads are resumable. Normalization statistics are training-split-only.
-- v2 checkpoints are not compatible with v1 (new heads, different forecast head architecture).
+- v2 checkpoints are not compatible with v1 (new heads, different forecast head architecture). v3 checkpoints are not compatible with v2 (new ReconHead, ForecastHead, ERIHead, and TemporalModuleV3 signatures).
+- v3 eval.py applies GAP_BIAS=0.3860 correction on gap pixels and uses bloom threshold 0.90 (was 0.5). Re-run `calibrate.py` after retraining to update these values.
 - cuFFT/cuDNN/cuBLAS registration warnings during Kaggle DDP training are harmless.
