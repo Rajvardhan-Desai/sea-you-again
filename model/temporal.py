@@ -160,6 +160,7 @@ class ConvLSTMLayer(nn.Module):
         if T == 0:
             raise ValueError("ConvLSTMLayer requires a non-empty sequence (T > 0).")
 
+        from torch.utils.checkpoint import checkpoint as ckpt
         state = None
         outputs: list[Tensor] = []
         for t in range(T):
