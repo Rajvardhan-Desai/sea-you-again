@@ -221,7 +221,8 @@ def forecast_loss(
 
     # [v3] SSIM component — per-step, averaged
     if ssim_weight > 0.0:
-        window = _gaussian_window(7, 1.5).to(pred.device, pred.dtype)
+        # [v3.1] Force FP32 window — pred.dtype may be FP16 from model output
+        window = _gaussian_window(7, 1.5).to(pred.device, torch.float32)
         B, S, H, W = pred.shape
         ssim_total = 0.0
         for s in range(S):
