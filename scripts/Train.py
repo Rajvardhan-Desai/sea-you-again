@@ -595,9 +595,11 @@ def main() -> None:
         bloom_threshold=2.5,
     ).to(device)
 
-    start_epoch   = 0
-    global_step   = 0
-    best_val_loss = float("inf")
+    start_epoch       = 0
+    global_step       = 0
+    best_val_loss     = float("inf")
+    nan_val_streak    = 0
+    MAX_NAN_EPOCHS    = 3   # [v3.1] stop training after 3 consecutive NaN val epochs
 
     if args.resume:
         start_epoch, global_step, best_val_loss = load_checkpoint(
@@ -678,13 +680,22 @@ def main() -> None:
 
             if not math.isfinite(val_loss):
                 log.warning("Validation loss is non-finite; skipping checkpoint save for this epoch.")
-            elif val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(
-                    ckpt_dir / "best.pt", model, optimizer,
-                    scheduler, scaler, epoch, global_step, best_val_loss,
-                )
-                log.info(f"  -> New best val loss: {best_val_loss:.4f}")
+                nan_val_streak += 1
+                if nan_val_streak >= MAX_NAN_EPOCHS:
+                    log.error(
+                        f"Stopping: {nan_val_streak} consecutive NaN val epochs. "
+                        f"Best checkpoint: {ckpt_dir / 'best.pt'} (val {best_val_loss:.4f})"
+                    )
+                    break
+            else:
+                nan_val_streak = 0
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(
+                        ckpt_dir / "best.pt", model, optimizer,
+                        scheduler, scaler, epoch, global_step, best_val_loss,
+                    )
+                    log.info(f"  -> New best val loss: {best_val_loss:.4f}")
 
             if math.isfinite(val_loss):
                 save_checkpoint(
@@ -698,8 +709,18 @@ def main() -> None:
                     scheduler, scaler, epoch, global_step, val_loss,
                 )
 
+        # [v3.1] Broadcast early-stop decision to all ranks
         if using_ddp:
+            should_stop = torch.tensor(
+                1.0 if (is_main and nan_val_streak >= MAX_NAN_EPOCHS) else 0.0,
+                device=device,
+            )
+            dist.broadcast(should_stop, src=0)
             dist.barrier()
+            if should_stop.item() > 0.5:
+                break
+        elif nan_val_streak >= MAX_NAN_EPOCHS:
+            break
 
     if writer:
         writer.close()
