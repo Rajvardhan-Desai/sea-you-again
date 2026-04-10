@@ -284,6 +284,9 @@ def run_epoch(
                 if is_valid_loss.item() < world_size:
                     optimizer.zero_grad(set_to_none=True)
                     n_skipped += 1.0
+                    del outputs, loss, breakdown
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     continue
 
                 stepped = False
@@ -298,9 +301,12 @@ def run_epoch(
                     is_valid_grad = reduce_sum_tensor(is_valid_grad, world_size)
                     
                     if is_valid_grad.item() < world_size:
-                        scaler.update() # <--- FIXED: Let scaler see NaNs so it lowers scale factor
+                        scaler.update()
                         optimizer.zero_grad(set_to_none=True)
                         n_skipped += 1.0
+                        del outputs, loss, breakdown
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         continue
                     else:
                         scaler.step(optimizer)
@@ -318,8 +324,11 @@ def run_epoch(
                     if is_valid_grad.item() < world_size:
                         optimizer.zero_grad(set_to_none=True)
                         n_skipped += 1.0
+                        del outputs, loss, breakdown
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         continue
-                        
+
                     optimizer.step()
                     stepped = True
 
@@ -364,12 +373,21 @@ def run_epoch(
                     )
                     if holdout_mask.any():
                         eval_batch = build_gap_eval_batch(batch, holdout_mask)
-                        with autocast(device_type=amp_device, enabled=amp_enabled):
-                            gap_outputs = model(eval_batch)
-                        gap_pred = gap_outputs["recon"].squeeze(1).float()
-                        sse, count = compute_masked_rmse_stats(gap_pred, last_chl, holdout_mask)
-                        gap_sse += sse
-                        gap_count += count
+                        try:
+                            with autocast(device_type=amp_device, enabled=amp_enabled):
+                                gap_outputs = model(eval_batch)
+                            gap_pred = gap_outputs["recon"].squeeze(1).float()
+                            sse, count = compute_masked_rmse_stats(gap_pred, last_chl, holdout_mask)
+                            gap_sse += sse
+                            gap_count += count
+                            del gap_outputs
+                        except RuntimeError as e:
+                            if "out of memory" not in str(e):
+                                raise
+                            # OOM during gap eval — skip this batch's gap metric
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                        del eval_batch
 
             if "routing_weights" in outputs:
                 batch_routing_sum = outputs["routing_weights"].detach().sum(dim=0, dtype=torch.float64)
@@ -545,7 +563,7 @@ def main() -> None:
         model = DDP(
             model,
             device_ids=[local_rank],
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
 
@@ -577,9 +595,11 @@ def main() -> None:
         bloom_threshold=2.5,
     ).to(device)
 
-    start_epoch   = 0
-    global_step   = 0
-    best_val_loss = float("inf")
+    start_epoch       = 0
+    global_step       = 0
+    best_val_loss     = float("inf")
+    nan_val_streak    = 0
+    MAX_NAN_EPOCHS    = 3   # [v3.1] stop training after 3 consecutive NaN val epochs
 
     if args.resume:
         start_epoch, global_step, best_val_loss = load_checkpoint(
@@ -660,13 +680,22 @@ def main() -> None:
 
             if not math.isfinite(val_loss):
                 log.warning("Validation loss is non-finite; skipping checkpoint save for this epoch.")
-            elif val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(
-                    ckpt_dir / "best.pt", model, optimizer,
-                    scheduler, scaler, epoch, global_step, best_val_loss,
-                )
-                log.info(f"  -> New best val loss: {best_val_loss:.4f}")
+                nan_val_streak += 1
+                if nan_val_streak >= MAX_NAN_EPOCHS:
+                    log.error(
+                        f"Stopping: {nan_val_streak} consecutive NaN val epochs. "
+                        f"Best checkpoint: {ckpt_dir / 'best.pt'} (val {best_val_loss:.4f})"
+                    )
+                    break
+            else:
+                nan_val_streak = 0
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(
+                        ckpt_dir / "best.pt", model, optimizer,
+                        scheduler, scaler, epoch, global_step, best_val_loss,
+                    )
+                    log.info(f"  -> New best val loss: {best_val_loss:.4f}")
 
             if math.isfinite(val_loss):
                 save_checkpoint(
@@ -680,8 +709,18 @@ def main() -> None:
                     scheduler, scaler, epoch, global_step, val_loss,
                 )
 
+        # [v3.1] Broadcast early-stop decision to all ranks
         if using_ddp:
+            should_stop = torch.tensor(
+                1.0 if (is_main and nan_val_streak >= MAX_NAN_EPOCHS) else 0.0,
+                device=device,
+            )
+            dist.broadcast(should_stop, src=0)
             dist.barrier()
+            if should_stop.item() > 0.5:
+                break
+        elif nan_val_streak >= MAX_NAN_EPOCHS:
+            break
 
     if writer:
         writer.close()

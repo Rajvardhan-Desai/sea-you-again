@@ -6,6 +6,8 @@ Changes from v2:
     [v3] forecast_loss: added differentiable SSIM component (weight 0.2)
     [v3] eri_loss: class 1 weight 10.0 → 15.0 for better rare-class F1
     [v3] LossWeights: holdout weight 0.5 → 0.8 for stronger gap supervision
+    [v3.1] NLL: log_var floor -6 → -4, per-pixel NLL clamped at 10.0
+    [v3.1] Holdout loss on sqrt-curriculum to prevent gradient conflicts
 
 Changes from v1:
     [PERF 3] aux weight 0.001 → 0.01 — expert 0 was nearly dead at 5.3%
@@ -114,10 +116,12 @@ def recon_loss(
     pred_sq   = pred.squeeze(1).float()
     lv_sq     = log_var.squeeze(1).float()
     
-    # Raise clamp floor to -6.0 to prevent FP16 division overflows
-    lv_clamped = lv_sq.clamp(min=-6.0, max=10.0)
+    # [v3.1] Floor at -4 limits max precision weight to ~55x (was -6 → 400x)
+    lv_clamped = lv_sq.clamp(min=-4.0, max=10.0)
 
     nll = 0.5 * (lv_clamped + (pred_sq - target_t).pow(2) / lv_clamped.exp())
+    # [v3.1] Per-pixel clamp prevents a few bad pixels from dominating gradients
+    nll = nll.clamp(max=10.0)
 
     n_valid = sup_mask.sum().clamp(min=1.0)
     return (nll * sup_mask).sum() / n_valid
@@ -152,13 +156,15 @@ def holdout_recon_loss(
     sup_mask = holdout_mask * ocean
     n_valid  = sup_mask.sum().clamp(min=1.0)
 
-    # FORCE FP32 and raise minimum clamp to -6.0
+    # [v3.1] Floor at -4 limits max precision weight to ~55x (was -6 → 400x)
     pred_sq = pred.squeeze(1).float()
-    lv_sq   = log_var.squeeze(1).float().clamp(min=-6.0, max=10.0)
+    lv_sq   = log_var.squeeze(1).float().clamp(min=-4.0, max=10.0)
     target_f = target.float()
 
     # Standard NLL component
     nll = 0.5 * (lv_sq + (pred_sq - target_f).pow(2) / lv_sq.exp())
+    # [v3.1] Per-pixel clamp prevents a few bad holdout pixels from dominating
+    nll = nll.clamp(max=10.0)
     nll_loss = (nll * sup_mask).sum() / n_valid
 
     # [PERF 4] Spatial gradient matching — penalize Laplacian mismatch
@@ -312,21 +318,29 @@ def bloom_forecast_loss(
     pos_weight_value: float = 20.0,
 ) -> Tensor:
     """
-    Binary cross-entropy loss for bloom prediction at each forecast step.
+    Binary cross-entropy loss for elevated Chl-a prediction at each forecast step.
 
-    Targets are derived from target_chl: a pixel is "bloom" if its
-    normalized Chl-a exceeds bloom_threshold at that forecast step.
+    Targets are derived from target_chl: a pixel is "elevated" if its
+    z-scored Chl-a exceeds bloom_threshold at that forecast step.
+    With the default threshold=2.5, this detects anomalously high Chl-a
+    (≈0.94 mg/m³ raw), not true algal blooms (≥10 mg/m³).
 
     Args:
         logits:         (B, H_fcast, H, W)  raw logits from BloomForecastHead
         target_chl:     (B, H_fcast, H, W)  future Chl-a (normalized)
         target_mask:    (B, H_fcast, H, W)  1 = valid supervisable pixel
         land_mask:      (B, H, W)           1 = land
-        bloom_threshold: threshold on normalized Chl-a for bloom detection.
-                        This should be set from norm_stats:
-                        threshold = (log1p(10.0) - chl_mean) / chl_std
-                        where 10.0 mg/m³ is the raw bloom threshold.
-        pos_weight_value: positive class weight for BCE. Blooms are rare
+        bloom_threshold: threshold on z-scored Chl-a for "elevated" detection.
+                        Train.py passes 2.5, which in z-score space corresponds
+                        to raw Chl-a ≈ exp(2.5*0.2077 + 0.1450) - 1 ≈ 0.94 mg/m³.
+                        This predicts "elevated Chl-a anomalies" (top ~0.6% of
+                        pixels), NOT true algal blooms (≥10 mg/m³). The true
+                        bloom threshold in z-score space would be
+                        (log1p(10.0) - 0.1450) / 0.2077 ≈ 10.85, which produces
+                        near-zero positives and is impractical for training.
+                        NOTE: This is intentionally different from bloom_mask
+                        (masker.py, raw 10 mg/m³) used for ERI supervision.
+        pos_weight_value: positive class weight for BCE. Elevated events are rare
                          (~0.5% of pixels), so we upweight positives heavily.
 
     Returns:
@@ -505,13 +519,19 @@ class MARASSLoss(nn.Module):
         # --- Curriculum scaling for secondary tasks ---
         scale = self._curriculum_scale(step, total_steps)
 
+        # [v3.1] Holdout loss also ramps with curriculum to prevent gradient
+        # conflict between heavy gap reconstruction and secondary tasks.
+        # Holdout uses sqrt(scale) so it reaches full weight faster than
+        # secondary tasks (gap-fill is prerequisite for good forecasts).
+        holdout_scale = scale ** 0.5  # reaches 0.84 when scale=0.70
+
         total = (
             self.w.recon       * l_recon
           + self.w.forecast    * scale * l_forecast
           + self.w.eri         * scale * l_eri
           + self.w.bloom_fcast * scale * l_bloom_fcast   # [FEAT 1]
           + self.w.aux         * l_aux                    # [PERF 3] 0.01
-          + self.w.holdout     * l_holdout
+          + self.w.holdout     * holdout_scale * l_holdout
         )
 
         breakdown = {
