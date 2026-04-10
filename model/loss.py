@@ -72,16 +72,27 @@ def _ssim_map(
     x: Tensor, y: Tensor, window: Tensor,
     C1: float = 0.01 ** 2, C2: float = 0.03 ** 2,
 ) -> Tensor:
-    """Per-pixel SSIM between (B, 1, H, W) tensors."""
-    pad = window.shape[-1] // 2
-    mu_x  = F.conv2d(x, window, padding=pad)
-    mu_y  = F.conv2d(y, window, padding=pad)
-    s_xx  = F.conv2d(x * x, window, padding=pad) - mu_x.pow(2)
-    s_yy  = F.conv2d(y * y, window, padding=pad) - mu_y.pow(2)
-    s_xy  = F.conv2d(x * y, window, padding=pad) - mu_x * mu_y
-    num   = (2 * mu_x * mu_y + C1) * (2 * s_xy + C2)
-    den   = (mu_x.pow(2) + mu_y.pow(2) + C1) * (s_xx + s_yy + C2)
-    return num / den                                      # (B, 1, H, W)
+    """Per-pixel SSIM between (B, 1, H, W) tensors.
+
+    [v3.1] Runs entirely in FP32 via autocast disable.  Under AMP, autocast
+    would downcast F.conv2d to FP16, causing catastrophic cancellation in
+    the variance terms (s_xx, s_yy) and eventual NaN at epoch 16+.
+    """
+    # [v3.1] Force FP32 — autocast downcasts F.conv2d to FP16 despite
+    # explicit .float() on inputs, causing NaN from variance cancellation
+    with torch.amp.autocast("cuda", enabled=False):
+        x = x.float()
+        y = y.float()
+        window = window.float()
+        pad = window.shape[-1] // 2
+        mu_x  = F.conv2d(x, window, padding=pad)
+        mu_y  = F.conv2d(y, window, padding=pad)
+        s_xx  = F.conv2d(x * x, window, padding=pad) - mu_x.pow(2)
+        s_yy  = F.conv2d(y * y, window, padding=pad) - mu_y.pow(2)
+        s_xy  = F.conv2d(x * y, window, padding=pad) - mu_x * mu_y
+        num   = (2 * mu_x * mu_y + C1) * (2 * s_xy + C2)
+        den   = (mu_x.pow(2) + mu_y.pow(2) + C1) * (s_xx + s_yy + C2)
+        return num / den                                  # (B, 1, H, W)
 
 
 # ======================================================================
@@ -221,8 +232,7 @@ def forecast_loss(
 
     # [v3] SSIM component — per-step, averaged
     if ssim_weight > 0.0:
-        # [v3.1] Force FP32 window — pred.dtype may be FP16 from model output
-        window = _gaussian_window(7, 1.5).to(pred.device, torch.float32)
+        window = _gaussian_window(7, 1.5).to(pred.device)
         B, S, H, W = pred.shape
         ssim_total = 0.0
         for s in range(S):

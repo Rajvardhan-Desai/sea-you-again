@@ -271,16 +271,11 @@ def run_epoch(
 
             with autocast(device_type=amp_device, enabled=amp_enabled):
                 outputs = model(batch)
-
-            # [v3.1] Loss computed OUTSIDE autocast so F.conv2d (SSIM)
-            # and all reductions stay in FP32.  AMP only covers the
-            # model forward pass; loss functions already force .float()
-            # but autocast was overriding F.conv2d to FP16.
-            loss, breakdown = criterion(
-                outputs, batch,
-                step=global_step if is_train else None,
-                total_steps=total_steps,
-            )
+                loss, breakdown = criterion(
+                    outputs, batch,
+                    step=global_step if is_train else None,
+                    total_steps=total_steps,
+                )
 
             if is_train:
                 is_valid_loss = torch.tensor(1.0 if torch.isfinite(loss) else 0.0, device=device)
