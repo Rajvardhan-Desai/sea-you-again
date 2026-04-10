@@ -381,7 +381,9 @@ def run_epoch(
                             gap_sse += sse
                             gap_count += count
                             del gap_outputs
-                        except RuntimeError:
+                        except RuntimeError as e:
+                            if "out of memory" not in str(e):
+                                raise
                             # OOM during gap eval — skip this batch's gap metric
                             if device.type == "cuda":
                                 torch.cuda.empty_cache()
