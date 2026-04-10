@@ -208,14 +208,15 @@ class TemporalReconAttention(nn.Module):
             k = self.k_proj(seq_flat).reshape(B, T, nH, dH, H * W)
             v = self.v_proj(seq_flat).reshape(B, T, nH, dH, H * W)
 
-            # Pool K,V spatially weighted by obs_mask
-            mask_weight = obs_mask.reshape(B, T, 1, 1, H * W)     
-            mask_sum = mask_weight.sum(dim=-1).clamp(min=1.0)     
-            k_pooled = (k * mask_weight).sum(dim=-1) / mask_sum   
-            v_pooled = (v * mask_weight).sum(dim=-1) / mask_sum   
+            # Pool K,V spatially weighted by obs_mask (einsum avoids large broadcast intermediates)
+            mask_flat = obs_mask.reshape(B, T, H * W)                          # (B, T, HW)
+            mask_sum = mask_flat.sum(dim=-1, keepdim=True).clamp(min=1.0)      # (B, T, 1)
+            k_pooled = torch.einsum('bthds,bts->bthd', k, mask_flat) / mask_sum.unsqueeze(2)
+            v_pooled = torch.einsum('bthds,bts->bthd', v, mask_flat) / mask_sum.unsqueeze(2)
+            del k, v, mask_flat
 
-            k_pooled = k_pooled.permute(0, 2, 1, 3)   
-            v_pooled = v_pooled.permute(0, 2, 1, 3)   
+            k_pooled = k_pooled.permute(0, 2, 1, 3)
+            v_pooled = v_pooled.permute(0, 2, 1, 3)
 
             # L2-normalize Q and K safely to prevent zero-vector gradient explosion
             q_norm = q.norm(dim=-1, keepdim=True).clamp(min=1e-3)
@@ -225,7 +226,8 @@ class TemporalReconAttention(nn.Module):
             k_pooled = k_pooled / k_norm
 
             # Cosine-similarity attention with learnable temperature
-            attn = (q @ k_pooled.transpose(-2, -1)) * self.logit_scale  
+            # Clamp logit_scale to prevent softmax overflow (exp(80) ~ 5.5e34, safe in FP32)
+            attn = (q @ k_pooled.transpose(-2, -1)) * self.logit_scale.clamp(max=80.0)
             attn = attn.softmax(dim=-1)
 
             out = attn @ v_pooled                       

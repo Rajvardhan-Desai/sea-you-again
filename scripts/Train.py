@@ -284,6 +284,9 @@ def run_epoch(
                 if is_valid_loss.item() < world_size:
                     optimizer.zero_grad(set_to_none=True)
                     n_skipped += 1.0
+                    del outputs, loss, breakdown
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     continue
 
                 stepped = False
@@ -298,9 +301,12 @@ def run_epoch(
                     is_valid_grad = reduce_sum_tensor(is_valid_grad, world_size)
                     
                     if is_valid_grad.item() < world_size:
-                        scaler.update() # <--- FIXED: Let scaler see NaNs so it lowers scale factor
+                        scaler.update()
                         optimizer.zero_grad(set_to_none=True)
                         n_skipped += 1.0
+                        del outputs, loss, breakdown
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         continue
                     else:
                         scaler.step(optimizer)
@@ -318,8 +324,11 @@ def run_epoch(
                     if is_valid_grad.item() < world_size:
                         optimizer.zero_grad(set_to_none=True)
                         n_skipped += 1.0
+                        del outputs, loss, breakdown
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         continue
-                        
+
                     optimizer.step()
                     stepped = True
 
@@ -364,12 +373,19 @@ def run_epoch(
                     )
                     if holdout_mask.any():
                         eval_batch = build_gap_eval_batch(batch, holdout_mask)
-                        with autocast(device_type=amp_device, enabled=amp_enabled):
-                            gap_outputs = model(eval_batch)
-                        gap_pred = gap_outputs["recon"].squeeze(1).float()
-                        sse, count = compute_masked_rmse_stats(gap_pred, last_chl, holdout_mask)
-                        gap_sse += sse
-                        gap_count += count
+                        try:
+                            with autocast(device_type=amp_device, enabled=amp_enabled):
+                                gap_outputs = model(eval_batch)
+                            gap_pred = gap_outputs["recon"].squeeze(1).float()
+                            sse, count = compute_masked_rmse_stats(gap_pred, last_chl, holdout_mask)
+                            gap_sse += sse
+                            gap_count += count
+                            del gap_outputs
+                        except RuntimeError:
+                            # OOM during gap eval — skip this batch's gap metric
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                        del eval_batch
 
             if "routing_weights" in outputs:
                 batch_routing_sum = outputs["routing_weights"].detach().sum(dim=0, dtype=torch.float64)
@@ -545,7 +561,7 @@ def main() -> None:
         model = DDP(
             model,
             device_ids=[local_rank],
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
 
