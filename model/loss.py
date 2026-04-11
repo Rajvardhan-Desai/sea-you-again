@@ -264,37 +264,44 @@ def eri_loss(
     B, n_levels, H, W = logits.shape
     ocean = 1.0 - land_mask
 
-    log_probs = F.log_softmax(logits, dim=1)
-    probs     = log_probs.exp()
+    # [v3.1] Force FP32 — product of 4 terms with class weight 15.0
+    # can overflow FP16 during backward
+    with torch.amp.autocast("cuda", enabled=False):
+        logits_f = logits.float()
+        target_f = target.float()
+        ocean_f  = ocean.float()
 
-    target_long = target.long().clamp(0, n_levels - 1)
-    nll = F.nll_loss(log_probs, target_long, reduction="none")
+        log_probs = F.log_softmax(logits_f, dim=1)
+        probs     = log_probs.exp()
 
-    # [v3] class 1 weight 10.0 → 15.0 (was 5.0 in v1) for 0.03% imbalance
-    class_weights = torch.tensor(
-        [0.15, 15.0, 4.0, 4.0, 5.0], device=logits.device
-    )
-    sample_weight = class_weights[target_long]
+        target_long = target.long().clamp(0, n_levels - 1)
+        nll = F.nll_loss(log_probs, target_long, reduction="none")
 
-    level_idx  = torch.arange(n_levels, device=logits.device, dtype=torch.float)
-    level_idx  = level_idx.view(1, n_levels, 1, 1)
-    soft_level = (probs * level_idx).sum(dim=1)
-    ord_penalty = 1.0 + (soft_level - target.float()).abs()
+        # [v3] class 1 weight 10.0 → 15.0 (was 5.0 in v1) for 0.03% imbalance
+        class_weights = torch.tensor(
+            [0.15, 15.0, 4.0, 4.0, 5.0], device=logits.device, dtype=torch.float32
+        )
+        sample_weight = class_weights[target_long]
 
-    p_correct = probs.gather(
-        dim=1, index=target_long.unsqueeze(1)
-    ).squeeze(1)
-    focal_weight = (1.0 - p_correct).clamp(min=0.0).pow(focal_gamma)
+        level_idx  = torch.arange(n_levels, device=logits.device, dtype=torch.float32)
+        level_idx  = level_idx.view(1, n_levels, 1, 1)
+        soft_level = (probs * level_idx).sum(dim=1)
+        ord_penalty = 1.0 + (soft_level - target_f).abs()
 
-    pixel_loss = nll * ord_penalty * sample_weight * focal_weight
+        p_correct = probs.gather(
+            dim=1, index=target_long.unsqueeze(1)
+        ).squeeze(1)
+        focal_weight = (1.0 - p_correct).clamp(min=0.0).pow(focal_gamma)
 
-    weight = ocean.clone()
-    if bloom_mask is not None:
-        bloom_any = (bloom_mask.sum(dim=1) > 0).float()
-        weight = weight * (1.0 + 5.0 * bloom_any)
+        pixel_loss = nll * ord_penalty * sample_weight * focal_weight
 
-    n_valid = weight.sum().clamp(min=1.0)
-    return (pixel_loss * weight).sum() / n_valid
+        weight = ocean_f.clone()
+        if bloom_mask is not None:
+            bloom_any = (bloom_mask.sum(dim=1) > 0).float()
+            weight = weight * (1.0 + 5.0 * bloom_any)
+
+        n_valid = weight.sum().clamp(min=1.0)
+        return (pixel_loss * weight).sum() / n_valid
 
 
 # ======================================================================
