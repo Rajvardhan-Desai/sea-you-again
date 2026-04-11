@@ -323,7 +323,7 @@ class UncertaintyHead(nn.Module):
         self.head = nn.Conv2d(cfg.embed_dim, 1, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.head(x).clamp(min=-4.0, max=10.0)
+        return self.head(x).clamp(min=-3.0, max=10.0)
 
 
 # ======================================================================
