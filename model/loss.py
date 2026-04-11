@@ -115,27 +115,29 @@ def recon_loss(
     Supervision is restricted to observed ocean pixels.
     Held-out pixels are excluded (supervised separately by holdout_recon_loss).
     """
-    # FORCE FP32 for numerical stability
-    target_t  = target[:, -1].float()
-    valid_t   = obs_mask[:, -1]
+    # [v3.1] Force FP32 — backward through NLL with low log_var produces
+    # gradients that overflow FP16 when multiplied by GradScaler
+    with torch.amp.autocast("cuda", enabled=False):
+        target_t  = target[:, -1].float()
+        valid_t   = obs_mask[:, -1].float()
 
-    ocean = 1.0 - land_mask
-    sup_mask = valid_t * ocean
-    if holdout_mask is not None:
-        sup_mask = sup_mask * (1.0 - holdout_mask)
+        ocean = (1.0 - land_mask).float()
+        sup_mask = valid_t * ocean
+        if holdout_mask is not None:
+            sup_mask = sup_mask * (1.0 - holdout_mask.float())
 
-    pred_sq   = pred.squeeze(1).float()
-    lv_sq     = log_var.squeeze(1).float()
-    
-    # [v3.1] Floor at -4 limits max precision weight to ~55x (was -6 → 400x)
-    lv_clamped = lv_sq.clamp(min=-4.0, max=10.0)
+        pred_sq   = pred.squeeze(1).float()
+        lv_sq     = log_var.squeeze(1).float()
 
-    nll = 0.5 * (lv_clamped + (pred_sq - target_t).pow(2) / lv_clamped.exp())
-    # [v3.1] Per-pixel clamp prevents a few bad pixels from dominating gradients
-    nll = nll.clamp(max=10.0)
+        # [v3.1] Floor at -3 limits max precision weight to ~20x (was -4 → 55x)
+        lv_clamped = lv_sq.clamp(min=-3.0, max=10.0)
 
-    n_valid = sup_mask.sum().clamp(min=1.0)
-    return (nll * sup_mask).sum() / n_valid
+        nll = 0.5 * (lv_clamped + (pred_sq - target_t).pow(2) / lv_clamped.exp())
+        # [v3.1] Per-pixel clamp prevents a few bad pixels from dominating gradients
+        nll = nll.clamp(max=10.0)
+
+        n_valid = sup_mask.sum().clamp(min=1.0)
+        return (nll * sup_mask).sum() / n_valid
 
 
 # ======================================================================
@@ -163,46 +165,49 @@ def holdout_recon_loss(
     the difference. This acts as a lightweight SSIM proxy without the
     computational cost of full SSIM.
     """
-    ocean    = 1.0 - land_mask
-    sup_mask = holdout_mask * ocean
-    n_valid  = sup_mask.sum().clamp(min=1.0)
+    # [v3.1] Force FP32 — same overflow risk as recon_loss (NLL backward
+    # through low log_var), plus Laplacian conv2d must avoid FP16 downcast
+    with torch.amp.autocast("cuda", enabled=False):
+        ocean    = (1.0 - land_mask).float()
+        sup_mask = holdout_mask.float() * ocean
+        n_valid  = sup_mask.sum().clamp(min=1.0)
 
-    # [v3.1] Floor at -4 limits max precision weight to ~55x (was -6 → 400x)
-    pred_sq = pred.squeeze(1).float()
-    lv_sq   = log_var.squeeze(1).float().clamp(min=-4.0, max=10.0)
-    target_f = target.float()
+        # [v3.1] Floor at -3 limits max precision weight to ~20x (was -4 → 55x)
+        pred_sq  = pred.squeeze(1).float()
+        lv_sq    = log_var.squeeze(1).float().clamp(min=-3.0, max=10.0)
+        target_f = target.float()
 
-    # Standard NLL component
-    nll = 0.5 * (lv_sq + (pred_sq - target_f).pow(2) / lv_sq.exp())
-    # [v3.1] Per-pixel clamp prevents a few bad holdout pixels from dominating
-    nll = nll.clamp(max=10.0)
-    nll_loss = (nll * sup_mask).sum() / n_valid
+        # Standard NLL component
+        nll = 0.5 * (lv_sq + (pred_sq - target_f).pow(2) / lv_sq.exp())
+        # [v3.1] Per-pixel clamp prevents a few bad holdout pixels from dominating
+        nll = nll.clamp(max=10.0)
+        nll_loss = (nll * sup_mask).sum() / n_valid
 
-    # [PERF 4] Spatial gradient matching — penalize Laplacian mismatch
-    # This encourages smooth, spatially coherent gap fills
-    laplacian_kernel = torch.tensor(
-        [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
-        dtype=pred_sq.dtype, device=pred_sq.device,
-    ).view(1, 1, 3, 3)
+        # [PERF 4] Spatial gradient matching — penalize Laplacian mismatch
+        # This encourages smooth, spatially coherent gap fills
+        laplacian_kernel = torch.tensor(
+            [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+            dtype=torch.float32, device=pred_sq.device,
+        ).view(1, 1, 3, 3)
 
-    pred_lap = F.conv2d(
-        pred_sq.unsqueeze(1), laplacian_kernel, padding=1
-    ).squeeze(1)
-    target_lap = F.conv2d(
-        target_f.unsqueeze(1), laplacian_kernel, padding=1
-    ).squeeze(1)
+        pred_lap = F.conv2d(
+            pred_sq.unsqueeze(1), laplacian_kernel, padding=1
+        ).squeeze(1)
+        target_lap = F.conv2d(
+            target_f.unsqueeze(1), laplacian_kernel, padding=1
+        ).squeeze(1)
 
-    grad_diff = (pred_lap - target_lap).pow(2)
-    grad_loss = (grad_diff * sup_mask).sum() / n_valid
+        grad_diff = (pred_lap - target_lap).pow(2)
+        grad_loss = (grad_diff * sup_mask).sum() / n_valid
 
-    # [v3] L1 bias penalty — directly penalizes systematic over/under-prediction
-    # on gap pixels (attacks the GAP_BIAS issue at the source)
-    bias = ((pred_sq - target_f) * sup_mask).sum() / n_valid
-    bias_loss = bias.abs()
+        # [v3] L1 bias penalty — directly penalizes systematic over/under-prediction
+        # on gap pixels (attacks the GAP_BIAS issue at the source)
+        bias = ((pred_sq - target_f) * sup_mask).sum() / n_valid
+        bias_loss = bias.abs()
 
-    # [v3] Laplacian weight raised from 0.02 → 0.05 (stable with grad clip 1.0)
-    # Was 0.1 in early v2, caused NaN at epoch 73; 0.05 is the safe middle ground
-    return nll_loss + 0.05 * grad_loss + 0.1 * bias_loss
+        # [v3] Laplacian weight raised from 0.02 → 0.05 (stable with grad clip 1.0)
+        # Was 0.1 in early v2, caused NaN at epoch 73; 0.05 is the safe middle ground
+        return nll_loss + 0.05 * grad_loss + 0.1 * bias_loss
 
 
 # ======================================================================
