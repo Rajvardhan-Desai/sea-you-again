@@ -581,12 +581,13 @@ def main() -> None:
     ], lr=args.lr)
 
     scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
-    # [v3.1] Conservative scaler: growth_factor=1.0 prevents scale from ever
-    # exceeding init_scale. With log_var floor=-3 (20x gradient amplifier) and
-    # scale=8192, max FP16 gradient = 8192*20.1*residual = 164k*residual.
+    # [v3.1] Conservative scaler: growth_interval=100000 exceeds total training
+    # steps (14100), so scale stays at 2^13=8192 for the entire run.
+    # With log_var floor=-3 (20x gradient amplifier) and scale=8192,
+    # max FP16 gradient = 8192*20.1*residual = 164k*residual.
     # Overflow requires residual > 0.40 (vs 0.073 with old floor=-4, scale=16k).
     scaler = GradScaler(
-        device="cuda", init_scale=2**13, growth_factor=1.0,
+        device="cuda", init_scale=2**13, growth_interval=100_000,
     ) if use_amp else None
 
     criterion = MARASSLoss(
