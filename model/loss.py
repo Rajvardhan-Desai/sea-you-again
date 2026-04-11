@@ -1,5 +1,12 @@
 """
-loss.py — MM-MARAS loss functions (v3)
+loss.py — MM-MARAS loss functions (v3.2)
+
+Changes from v3.1:
+    [v3.2] curriculum_frac 0.20 → 0.40: extend warmup to prevent gradient shock
+    [v3.2] eri_loss: class 1 weight 15.0 → 8.0, bloom_any mult 5.0 → 2.0
+    [v3.2] bloom_forecast_loss: pos_weight 20.0 → 10.0
+    [v3.2] forecast_loss + bloom_forecast_loss: force FP32 (consistency)
+    [v3.2] Per-component loss clamping (max=5.0) in MARASSLoss.forward
 
 Changes from v2:
     [v3] holdout_recon_loss: Laplacian weight 0.02 → 0.05, added L1 bias term
@@ -227,28 +234,36 @@ def forecast_loss(
 
     [v3] Added differentiable SSIM component to improve structural
     similarity of forecast maps. Weight 0.2 by default.
+    [v3.2] Force FP32 — consistent with all other loss functions.
     """
-    ocean = (1.0 - land_mask).unsqueeze(1)
-    valid = target_mask * ocean
+    # [v3.2] Force FP32 for consistent backward precision
+    with torch.amp.autocast("cuda", enabled=False):
+        pred = pred.float()
+        target = target.float()
+        target_mask = target_mask.float()
+        land_mask = land_mask.float()
 
-    huber = F.huber_loss(pred, target, reduction="none", delta=delta)
-    n_valid = valid.sum().clamp(min=1.0)
-    l_huber = (huber * valid).sum() / n_valid
+        ocean = (1.0 - land_mask).unsqueeze(1)
+        valid = target_mask * ocean
 
-    # [v3] SSIM component — per-step, averaged
-    if ssim_weight > 0.0:
-        window = _gaussian_window(7, 1.5).to(pred.device)
-        B, S, H, W = pred.shape
-        ssim_total = 0.0
-        for s in range(S):
-            p = (pred[:, s:s+1] * valid[:, s:s+1]).float()
-            t = (target[:, s:s+1] * valid[:, s:s+1]).float()
-            smap = _ssim_map(p, t, window)
-            ssim_total = ssim_total + (1.0 - smap).mean()
-        l_ssim = ssim_total / S
-        return l_huber + ssim_weight * l_ssim
+        huber = F.huber_loss(pred, target, reduction="none", delta=delta)
+        n_valid = valid.sum().clamp(min=1.0)
+        l_huber = (huber * valid).sum() / n_valid
 
-    return l_huber
+        # [v3] SSIM component — per-step, averaged
+        if ssim_weight > 0.0:
+            window = _gaussian_window(7, 1.5).to(pred.device)
+            B, S, H, W = pred.shape
+            ssim_total = 0.0
+            for s in range(S):
+                p = pred[:, s:s+1] * valid[:, s:s+1]
+                t = target[:, s:s+1] * valid[:, s:s+1]
+                smap = _ssim_map(p, t, window)
+                ssim_total = ssim_total + (1.0 - smap).mean()
+            l_ssim = ssim_total / S
+            return l_huber + ssim_weight * l_ssim
+
+        return l_huber
 
 
 # ======================================================================
@@ -282,9 +297,10 @@ def eri_loss(
         target_long = target.long().clamp(0, n_levels - 1)
         nll = F.nll_loss(log_probs, target_long, reduction="none")
 
-        # [v3] class 1 weight 10.0 → 15.0 (was 5.0 in v1) for 0.03% imbalance
+        # [v3.2] class 1 weight 15.0 → 8.0: still 53x above background (0.15),
+        # but reduces gradient amplification that caused epoch 9-14 NaN cascade
         class_weights = torch.tensor(
-            [0.15, 15.0, 4.0, 4.0, 5.0], device=logits.device, dtype=torch.float32
+            [0.15, 8.0, 4.0, 4.0, 5.0], device=logits.device, dtype=torch.float32
         )
         sample_weight = class_weights[target_long]
 
@@ -303,7 +319,9 @@ def eri_loss(
         weight = ocean_f.clone()
         if bloom_mask is not None:
             bloom_any = (bloom_mask.sum(dim=1) > 0).float()
-            weight = weight * (1.0 + 5.0 * bloom_any)
+            # [v3.2] 5.0 → 2.0: with class_weight=8 this caps max amplification
+            # at 24x (was 90x with weight=15, mult=5) to prevent gradient spikes
+            weight = weight * (1.0 + 2.0 * bloom_any)
 
         n_valid = weight.sum().clamp(min=1.0)
         return (pixel_loss * weight).sum() / n_valid
@@ -338,7 +356,7 @@ def bloom_forecast_loss(
     target_mask: Tensor,
     land_mask: Tensor,
     bloom_threshold: float = 0.0,
-    pos_weight_value: float = 20.0,
+    pos_weight_value: float = 10.0,
 ) -> Tensor:
     """
     Binary cross-entropy loss for elevated Chl-a prediction at each forecast step.
@@ -369,25 +387,33 @@ def bloom_forecast_loss(
     Returns:
         Scalar loss.
     """
-    ocean = (1.0 - land_mask).unsqueeze(1)           # (B, 1, H, W)
-    valid = target_mask * ocean                       # (B, H_fcast, H, W)
+    # [v3.2] Force FP32 — consistent with all other loss functions
+    with torch.amp.autocast("cuda", enabled=False):
+        logits = logits.float()
+        target_chl = target_chl.float()
+        target_mask = target_mask.float()
+        land_mask = land_mask.float()
 
-    # Build binary bloom target from forecast Chl-a
-    bloom_target = (target_chl > bloom_threshold).float()  # (B, H_fcast, H, W)
+        ocean = (1.0 - land_mask).unsqueeze(1)           # (B, 1, H, W)
+        valid = target_mask * ocean                       # (B, H_fcast, H, W)
 
-    # Positive class weight — blooms are very rare
-    pos_weight = torch.tensor(
-        [pos_weight_value], device=logits.device
-    )
+        # Build binary bloom target from forecast Chl-a
+        bloom_target = (target_chl > bloom_threshold).float()  # (B, H_fcast, H, W)
 
-    # Element-wise BCE with logits
-    bce = F.binary_cross_entropy_with_logits(
-        logits, bloom_target, reduction="none",
-        pos_weight=pos_weight,
-    )
+        # [v3.2] pos_weight 20.0 → 10.0: still 10x upweight for ~0.6% positives,
+        # but halves gradient amplification during curriculum ramp
+        pos_weight = torch.tensor(
+            [pos_weight_value], device=logits.device, dtype=torch.float32
+        )
 
-    n_valid = valid.sum().clamp(min=1.0)
-    return (bce * valid).sum() / n_valid
+        # Element-wise BCE with logits
+        bce = F.binary_cross_entropy_with_logits(
+            logits, bloom_target, reduction="none",
+            pos_weight=pos_weight,
+        )
+
+        n_valid = valid.sum().clamp(min=1.0)
+        return (bce * valid).sum() / n_valid
 
 
 def build_bloom_forecast_target(
@@ -435,7 +461,7 @@ class MARASSLoss(nn.Module):
     def __init__(
         self,
         weights: LossWeights | None = None,
-        curriculum_frac: float = 0.20,
+        curriculum_frac: float = 0.40,
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
         bloom_threshold: float = 0.0,
@@ -547,6 +573,15 @@ class MARASSLoss(nn.Module):
         # Holdout uses sqrt(scale) so it reaches full weight faster than
         # secondary tasks (gap-fill is prerequisite for good forecasts).
         holdout_scale = scale ** 0.5  # reaches 0.84 when scale=0.70
+
+        # [v3.2] Per-component loss clamping — prevents a single bad batch
+        # from injecting extreme gradients that corrupt AdamW moment estimates.
+        # Cap at 5.0 is ~10-50x the normal operating range; only activates on
+        # outlier batches, not during healthy training.
+        l_forecast    = l_forecast.clamp(max=5.0)
+        l_eri         = l_eri.clamp(max=5.0)
+        l_bloom_fcast = l_bloom_fcast.clamp(max=5.0)
+        l_holdout     = l_holdout.clamp(max=5.0)
 
         total = (
             self.w.recon       * l_recon
