@@ -132,6 +132,10 @@ class ConvLSTMCell(nn.Module):
         o = torch.sigmoid(o)
 
         c_new = f * c + i * g
+        # [v3.2] Clip cell state to prevent FP16 overflow over T=10 steps.
+        # tanh(5.0) = 0.9999 — no expressivity loss; prevents cascading NaN
+        # when model weights are perturbed by curriculum gradient shocks.
+        c_new = c_new.clamp(-5.0, 5.0)
         h_new = o * torch.tanh(c_new)
 
         return h_new, c_new
