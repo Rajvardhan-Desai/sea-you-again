@@ -581,12 +581,12 @@ def main() -> None:
     ], lr=args.lr)
 
     scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
-    # [v3.1] Conservative scaler: default init_scale=2^16 grew to 262k by
-    # epoch 16, causing FP16 overflow in backward. Lower init + slower growth
-    # keeps scale ≤ 2^15 through 50 epochs (14100 steps / 4000 = 3 doublings
-    # → 2^13 * 2^3 = 2^16 max, well within FP16 safe range).
+    # [v3.1] Conservative scaler: growth_factor=1.0 prevents scale from ever
+    # exceeding init_scale. With log_var floor=-3 (20x gradient amplifier) and
+    # scale=8192, max FP16 gradient = 8192*20.1*residual = 164k*residual.
+    # Overflow requires residual > 0.40 (vs 0.073 with old floor=-4, scale=16k).
     scaler = GradScaler(
-        device="cuda", init_scale=2**13, growth_interval=4000,
+        device="cuda", init_scale=2**13, growth_factor=1.0,
     ) if use_amp else None
 
     criterion = MARASSLoss(
