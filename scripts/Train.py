@@ -692,7 +692,6 @@ def main() -> None:
                         f"Stopping: {nan_val_streak} consecutive NaN val epochs. "
                         f"Best checkpoint: {ckpt_dir / 'best.pt'} (val {best_val_loss:.4f})"
                     )
-                    break
             else:
                 nan_val_streak = 0
                 if val_loss < best_val_loss:
