@@ -751,9 +751,8 @@ def forward_with_routing(model, batch):
     obs_mask_last = obs_mask[:, -1]
     recon = m.recon_head(decoded, opt_skip, obs_mask_last)
 
-    # v3: ERIHead takes (decoded, bloom_count)
-    bloom_count = bloom_mask.sum(dim=1)
-    eri = m.eri_head(decoded, bloom_count)
+    # v3.1: ERIHead takes only decoded (bloom_count removed — label leakage fix)
+    eri = m.eri_head(decoded)
 
     return {
         "recon":          recon,
