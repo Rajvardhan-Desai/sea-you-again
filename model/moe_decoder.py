@@ -77,6 +77,7 @@ class ExpertBlock(nn.Module):
             nn.Conv2d(dim, hidden, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, hidden),
             nn.GELU(),
+            nn.Dropout2d(0.1),  # [v3.3] regularize experts
             nn.Conv2d(hidden, dim, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, dim),
         )
