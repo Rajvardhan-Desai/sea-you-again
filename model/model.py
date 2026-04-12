@@ -1,5 +1,9 @@
 """
-model.py — MM-MARAS top-level model (v3.2)
+model.py — MM-MARAS top-level model (v3.3)
+
+Changes from v3.2:
+    [v3.3] Dropout(0.2) in ReconHead, ForecastHead, ERIHead, BloomForecastHead
+    [v3.3] holdout_frac 0.30 → 0.40 for stronger gap-fill supervision
 
 Changes from v3.1:
     [v3.2] TemporalModuleV3: GroupNorm on seq_mean before residual injection
@@ -80,7 +84,7 @@ class ModelConfig:
     embed_dim: int = 256
     n_experts: int = 4
     n_eri_levels: int = 5
-    holdout_frac: float = 0.30
+    holdout_frac: float = 0.40  # [v3.3] 0.30→0.40: more gap-fill training signal
 
 
 # ======================================================================
@@ -99,6 +103,7 @@ class ReconHead(nn.Module):
     v3.1: Added dilation=8 layer, extending the effective receptive field
     from 9x9 to 25x25 pixels. Real cloud gaps span 15-30+ pixels, so
     interior gap pixels need access to valid observations further away.
+    v3.3: Added dropout (0.2) to combat overfitting.
 
     Input:
         decoded:  (B, D, H, W)     from MoE decoder
@@ -111,6 +116,9 @@ class ReconHead(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         D = cfg.embed_dim
+
+        # [v3.3] Dropout to combat overfitting (44M params on 1264 patches)
+        self.drop = nn.Dropout2d(0.2)
 
         # Fuse decoded + skip + mask: D + D + 1 → D
         self.fuse = nn.Sequential(
@@ -148,6 +156,7 @@ class ReconHead(nn.Module):
             obs_mask = obs_mask.unsqueeze(1)
 
         x = self.fuse(torch.cat([decoded, opt_skip, obs_mask], dim=1))
+        x = self.drop(x)  # [v3.3]
         x = self.spatial(x)
         return self.out_proj(x)     # (B, 1, H, W)
 
@@ -262,6 +271,9 @@ class ForecastHead(nn.Module):
         D = cfg.embed_dim
         self.H_fcast = cfg.H_fcast
 
+        # [v3.3] Dropout to combat overfitting
+        self.drop = nn.Dropout2d(0.2)
+
         # Stage 1: parallel prediction (shared trunk + per-step output)
         self.trunk = nn.Sequential(
             nn.Conv2d(D, D, kernel_size=3, padding=1, bias=False),
@@ -299,7 +311,7 @@ class ForecastHead(nn.Module):
         B, D, H, W = decoded.shape
 
         # Stage 1: parallel prediction
-        shared = self.trunk(decoded)
+        shared = self.drop(self.trunk(decoded))  # [v3.3]
         parallel_preds = [head(shared) for head in self.step_heads]
 
         # Stage 2: autoregressive refinement
@@ -346,10 +358,12 @@ class ERIHead(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         D = cfg.embed_dim
+        # [v3.3] Added dropout to combat overfitting
         self.head = nn.Sequential(
             nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, D // 2),
             nn.GELU(),
+            nn.Dropout2d(0.2),
             nn.Conv2d(D // 2, cfg.n_eri_levels, kernel_size=1),
         )
 
@@ -368,6 +382,8 @@ class BloomForecastHead(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         D = cfg.embed_dim
+        # [v3.3] Added dropout to combat overfitting
+        self.drop = nn.Dropout2d(0.2)
         self.trunk = nn.Sequential(
             nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, D // 2),
@@ -379,7 +395,7 @@ class BloomForecastHead(nn.Module):
         ])
 
     def forward(self, x: Tensor) -> Tensor:
-        shared = self.trunk(x)
+        shared = self.drop(self.trunk(x))  # [v3.3]
         steps = [head(shared) for head in self.step_heads]
         return torch.cat(steps, dim=1)
 
