@@ -1,5 +1,8 @@
 """
-loss.py — MM-MARAS loss functions (v3.2)
+loss.py — MM-MARAS loss functions (v3.3)
+
+Changes from v3.2:
+    [v3.3] curriculum_frac 0.40 → 1.0: ramp secondary losses over full training
 
 Changes from v3.1:
     [v3.2] curriculum_frac 0.20 → 0.40: extend warmup to prevent gradient shock
@@ -461,7 +464,7 @@ class MARASSLoss(nn.Module):
     def __init__(
         self,
         weights: LossWeights | None = None,
-        curriculum_frac: float = 0.40,
+        curriculum_frac: float = 1.0,   # [v3.3] 0.40→1.0: ramp over full training to prevent overfitting
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
         bloom_threshold: float = 0.0,

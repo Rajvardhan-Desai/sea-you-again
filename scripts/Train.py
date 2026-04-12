@@ -148,8 +148,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--resume",       default=None,            help="Path to checkpoint to resume from")
     p.add_argument("--epochs",        type=int,   default=50)
     p.add_argument("--batch-size",    type=int,   default=4)
-    p.add_argument("--lr",            type=float, default=1e-4)
-    p.add_argument("--weight-decay",  type=float, default=1e-2)
+    p.add_argument("--lr",            type=float, default=3e-5)   # [v3.3] 1e-4→3e-5: slower to prevent overfitting
+    p.add_argument("--weight-decay",  type=float, default=5e-2)  # [v3.3] 1e-2→5e-2: stronger regularization
     p.add_argument("--grad-clip",     type=float, default=1.0)
     p.add_argument("--warmup-epochs", type=int,   default=5)
     p.add_argument("--save-every",    type=int,   default=10)
@@ -607,6 +607,9 @@ def main() -> None:
     best_val_loss     = float("inf")
     nan_val_streak    = 0
     MAX_NAN_EPOCHS    = 3   # [v3.1] stop training after 3 consecutive NaN val epochs
+    # [v3.3] Early stopping — model peaked at epoch 5/50 last run (severe overfitting)
+    no_improve_count  = 0
+    EARLY_STOP_PATIENCE = 10
 
     if args.resume:
         start_epoch, global_step, best_val_loss = load_checkpoint(
@@ -697,11 +700,19 @@ def main() -> None:
                 nan_val_streak = 0
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    no_improve_count = 0  # [v3.3] reset patience
                     save_checkpoint(
                         ckpt_dir / "best.pt", model, optimizer,
                         scheduler, scaler, epoch, global_step, best_val_loss,
                     )
                     log.info(f"  -> New best val loss: {best_val_loss:.4f}")
+                else:
+                    no_improve_count += 1  # [v3.3]
+                    if no_improve_count >= EARLY_STOP_PATIENCE:
+                        log.info(
+                            f"  Early stopping: no improvement for {EARLY_STOP_PATIENCE} epochs. "
+                            f"Best: {best_val_loss:.4f}"
+                        )
 
             if math.isfinite(val_loss):
                 save_checkpoint(
@@ -716,16 +727,21 @@ def main() -> None:
                 )
 
         # [v3.1] Broadcast early-stop decision to all ranks
+        # [v3.3] Also triggers on patience-based early stopping
+        should_stop_flag = (
+            nan_val_streak >= MAX_NAN_EPOCHS
+            or no_improve_count >= EARLY_STOP_PATIENCE
+        )
         if using_ddp:
             should_stop = torch.tensor(
-                1.0 if (is_main and nan_val_streak >= MAX_NAN_EPOCHS) else 0.0,
+                1.0 if (is_main and should_stop_flag) else 0.0,
                 device=device,
             )
             dist.broadcast(should_stop, src=0)
             dist.barrier()
             if should_stop.item() > 0.5:
                 break
-        elif nan_val_streak >= MAX_NAN_EPOCHS:
+        elif should_stop_flag:
             break
 
     if writer:
