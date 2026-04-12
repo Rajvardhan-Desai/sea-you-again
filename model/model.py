@@ -1,5 +1,8 @@
 """
-model.py — MM-MARAS top-level model (v3)
+model.py — MM-MARAS top-level model (v3.2)
+
+Changes from v3.1:
+    [v3.2] TemporalModuleV3: GroupNorm on seq_mean before residual injection
 
 Architectural fixes for identified bottlenecks:
 
@@ -421,6 +424,9 @@ class TemporalModuleV3(nn.Module):
         self.layer2 = ConvLSTMLayer(embed_dim, embed_dim, kernel_size)
         self.norm1 = nn.GroupNorm(8, embed_dim)
         self.norm2 = nn.GroupNorm(8, embed_dim)
+        # [v3.2] Normalize seq_mean before using as residual — raw fusion
+        # output is unbounded and was overflowing Conv2d in layer2
+        self.seq_norm = nn.GroupNorm(8, embed_dim)
 
     def forward(self, fused: Tensor) -> tuple[Tensor, Tensor]:
         fused = fused.contiguous()
@@ -433,7 +439,9 @@ class TemporalModuleV3(nn.Module):
         ).reshape(B, T, D, H, W)
 
         # Layer 2: final state
-        seq_mean = fused.mean(dim=1)
+        # [v3.2] Normalize seq_mean — prevents unbounded residual injection
+        # that caused FP16 overflow in layer2's Conv2d → GroupNorm(Inf) → NaN
+        seq_mean = self.seq_norm(fused.mean(dim=1))
         h2_input = h1_seq + seq_mean.unsqueeze(1)
         h2 = self.norm2(self.layer2(h2_input))
 

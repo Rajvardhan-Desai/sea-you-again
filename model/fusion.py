@@ -1,5 +1,10 @@
 """
-fusion.py — Perceiver IO cross-modal fusion
+fusion.py — Perceiver IO cross-modal fusion (v3.2)
+
+Changes from v3.1:
+    [v3.2] CrossAttention: FP32 for attention matmul (prevents Q×K^T overflow)
+    [v3.2] PerceiverFusionBlock: clamp(±50) after each residual addition
+    [v3.2] FusionModule: clamp(±50) on blend output before temporal module
 
 Fuses optical, physics, mask, BGC, and discharge embeddings into a single
 feature map via cross-attention between learned latent vectors and the five
@@ -110,10 +115,14 @@ class CrossAttention(nn.Module):
         k = self.k_proj(kv).view(   N, Lkv, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(kv).view(   N, Lkv, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)     # (N, nH, Lq, Lkv)
-        attn = self.attn_drop(attn.softmax(dim=-1))
+        # [v3.2] Force FP32 for attention — Q×K^T dot product over head_dim
+        # can overflow FP16 as model weights evolve during training.
+        # Only the matmul + softmax run in FP32; projections stay in autocast.
+        with torch.amp.autocast("cuda", enabled=False):
+            attn = (q.float() * self.scale) @ k.float().transpose(-2, -1)
+            attn = self.attn_drop(attn.softmax(dim=-1))
+            out = (attn @ v.float()).transpose(1, 2).reshape(N, Lq, -1)
 
-        out = (attn @ v).transpose(1, 2).reshape(N, Lq, -1)  # (N, Lq, query_dim)
         return self.proj_drop(self.out_proj(out))
 
 
@@ -252,14 +261,20 @@ class PerceiverFusionBlock(nn.Module):
             self.cross_norm_q(latents),
             self.cross_norm_kv(kv_tokens),
         )                                                   # (N, n_latents, D)
+        # [v3.2] Clamp after each residual — prevents FP16 overflow from
+        # accumulated magnitude across 3 residual additions.  ±50 is well
+        # within FP16 range (65504) and far above normal activations (~3).
+        latents = latents.clamp(-50.0, 50.0)
 
         # Self-attention on latents
         lat_norm = self.self_norm(latents)
         lat_sa, _ = self.self_attn(lat_norm, lat_norm, lat_norm)
         latents = latents + lat_sa                         # (N, n_latents, D)
+        latents = latents.clamp(-50.0, 50.0)
 
         # MLP
         latents = latents + self.mlp(latents)              # (N, n_latents, D)
+        latents = latents.clamp(-50.0, 50.0)
 
         # Decode latents → full-resolution spatial tokens via learned
         # position-aware spatial queries instead of a flat transpose projection.
@@ -270,6 +285,7 @@ class PerceiverFusionBlock(nn.Module):
             self.decode_norm_q(spatial_queries),
             self.decode_norm_kv(latents),
         )                                                  # (N, H*W, D)
+        spatial = spatial.clamp(-50.0, 50.0)
         spatial = self.decode_norm(spatial)
         spatial = spatial.transpose(1, 2).view(N, D, H, W)
 
@@ -410,6 +426,8 @@ class FusionModule(nn.Module):
         # Blend fused output with mean of all inputs (residual stabilises training)
         mean_in = (opt_f + phy_f + mask_f + bgc_f + dis_f) / 5.0
         fused = self.blend(torch.cat([fused, mean_in], dim=1))    # (B*T, D, H, W)
+        # [v3.2] Clamp fusion output before it enters temporal module
+        fused = fused.clamp(-50.0, 50.0)
 
         return fused.view(B, T, D, H, W)
 
