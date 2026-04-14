@@ -6,90 +6,77 @@ MM-MARAS is a deep learning system for Bay of Bengal chlorophyll-a (Chl-a) recon
 
 The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~44.4M parameters) that consumes those patches.
 
-## Results (v2 checkpoint)
+## Results (v3.4 — current)
 
-The model code is v3 (see Architecture — v3 fixes below). These results are from the last trained checkpoint; re-training with the v3 architecture is in progress.
-
-Trained on 1,264 patches from the Bay of Bengal (2021-2024), evaluated on 260 test patches (2024-2025). Training used 2x T4 GPUs with DDP, AMP, batch size 4 per GPU. Phase 1: 60 epochs at lr=1e-4; Phase 2: 25 epochs at lr=5e-5. Total training time ~7.5 hours.
+Trained on 1,264 patches from the Bay of Bengal (2021-2024), evaluated on 260 test patches (2024-2025). Training: 2x T4 GPUs with DDP + AMP, batch size 4 per GPU, 50 epochs at lr=5e-5 (best checkpoint at epoch 9, val loss -1.2939). Early stopping with patience 12. Peak VRAM: ~7.7 GB per T4 GPU. Bloom threshold calibrated at 0.85.
 
 ### Reconstruction
 
 | Subset | Pixels | RMSE | MAE | Bias | R² | SSIM |
 |---|---|---|---|---|---|---|
-| All ocean | 1,031,940 | 0.1457 | 0.0670 | -0.0264 | 0.881 | 0.736 |
-| Valid (observed) | 848,900 | 0.1018 | 0.0317 | +0.0051 | 0.952 | 0.927 |
-| Gap (missing) | 183,040 | 0.2675 | 0.2310 | -0.1728 | -- | 0.000 |
+| All ocean | 1,031,940 | 0.3727 | 0.1783 | -0.0564 | 0.219 | 0.409 |
+| Valid (observed) | 848,900 | 0.1373 | 0.0572 | +0.0387 | 0.912 | 0.418 |
+| Gap (missing) | 183,040 | 0.8342 | 0.7399 | -0.4974 | -- | 0.000 |
 
-CRPS: 0.0228.
+CRPS: 0.0725.
 
 ### Forecast
 
 | Horizon | RMSE | MAE | SSIM |
 |---|---|---|---|
-| +1 day | 0.1315 | 0.0465 | 0.889 |
-| +2 days | 0.1572 | 0.0573 | 0.829 |
-| +3 days | 0.1791 | 0.0677 | 0.754 |
-| +4 days | 0.1946 | 0.0750 | 0.711 |
-| +5 days | 0.2046 | 0.0827 | 0.694 |
+| +1 day | 0.1963 | 0.0896 | 0.710 |
+| +2 days | 0.2038 | 0.0940 | 0.687 |
+| +3 days | 0.2093 | 0.0938 | 0.637 |
+| +4 days | 0.2153 | 0.0963 | 0.622 |
+| +5 days | 0.2193 | 0.0979 | 0.617 |
 
 ### ERI classification
 
-Accuracy: 0.9958. Macro F1: 0.687. Ordinal MAE: 0.004. Per-class F1: class 0 = 0.998, class 1 = 0.189, class 2 = 0.553, class 3 = 0.759, class 4 = 0.935.
+Accuracy: 0.9978. Macro F1: 0.521. Ordinal MAE: 0.003. Per-class F1: class 0 = 0.999, class 1 = 0.312, class 2 = 0.000, class 3 = 0.394, class 4 = 0.902.
+
+### Bloom lead-time prediction
+
+| Horizon | Precision | Recall | F1 |
+|---|---|---|---|
+| +1 day | 0.755 | 0.773 | 0.764 |
+| +2 days | 0.727 | 0.789 | 0.757 |
+| +3 days | 0.744 | 0.751 | 0.748 |
+| +4 days | 0.749 | 0.734 | 0.741 |
+| +5 days | 0.739 | 0.730 | 0.734 |
+
+Macro F1: 0.749. Bloom rate: ~1.18% of ocean pixels.
 
 ### Uncertainty calibration
 
-ECE: 0.0002. Variance-error correlation: 0.581.
+ECE: 0.0416. Variance-error correlation: 0.527.
 
 ### MoE routing
 
-Expert utilization: 1.000 (perfect). Routing entropy: 1.386 / 1.386 (maximum). All four experts equally utilized (24.8%, 25.0%, 25.0%, 25.2%).
+Expert utilization: 0.9995. Routing entropy: 1.386 / 1.386 (near-maximum). Expert weights: 25.9%, 23.5%, 25.5%, 25.1%.
 
-### v1 to v2 comparison
+### Ecosystem impact
 
-| Metric | v1 | v2 | Change |
+Mean: 0.241. P90: 0.597. P95: 0.760. High-impact fraction (score > 0.6): 9.89% of ocean pixels.
+
+### Version history
+
+<details>
+<summary>v2 → v3.4 metric progression</summary>
+
+| Metric | v2 | v3.2 | v3.4 |
 |---|---|---|---|
-| All RMSE | 0.2311 | **0.1457** | -37% |
-| All R² | 0.700 | **0.881** | +26% |
-| Valid RMSE | 0.1111 | **0.1018** | -8% |
-| Gap RMSE | 0.4940 | **0.2675** | -46% |
-| CRPS | 0.0264 | **0.0228** | -14% |
-| Forecast +1 SSIM | 0.862 | **0.889** | +3% |
-| Forecast +5 SSIM | 0.671 | **0.694** | +3% |
-| ECE | 0.0016 | **0.0002** | -88% |
-| Var-Err corr | 0.547 | **0.581** | +6% |
-| Expert utilization | 0.849 | **1.000** | +18% |
-| Expert 0 weight | 5.3% | **24.8%** | fixed |
+| Valid RMSE | 0.102 | **0.127** | 0.137 |
+| Valid R² | 0.952 | 0.925 | 0.912 |
+| Forecast +1 RMSE | 0.132 | 0.249 | **0.196** |
+| Forecast +1 SSIM | 0.889 | 0.488 | **0.710** |
+| Bloom Macro F1 | -- | 0.620 | **0.749** |
+| ERI Macro F1 | 0.687 | 0.335 | **0.521** |
+| CRPS | 0.023 | 0.079 | **0.073** |
+| MoE utilisation | 1.000 | -- | **0.9995** |
 
-## Results (v3)
+v3.2 introduced FP16 stability fixes (FP32 attention, activation clamps, GradScaler frozen at 8192). v3.3 added dropout + anti-overfitting changes (too aggressive — bloom F1 collapsed to 0.000). v3.4 dialed back to the optimal balance: kept dropout, reduced weight decay and curriculum speed.
 
-Trained on the same 1,264 / 260 / 260 patch split. Phase 1: 50 epochs at lr=1e-4; Phase 2 (fine-tune): 30 epochs (50-79) at lr=3e-5. Best checkpoint at epoch 58 (val loss -2.6229). Peak VRAM: ~7.1 GB per T4 GPU with AMP and gradient checkpointing. Post-hoc calibration applied (GAP_BIAS=0.3860, bloom threshold=0.90).
-
-### Headline metrics
-
-| Metric | Value |
-|---|---|
-| Valid RMSE | 0.0716 |
-| Valid R² | 0.9761 |
-| Valid SSIM | 0.9741 |
-| Forecast t+1 RMSE | 0.1180 |
-| Forecast t+1 SSIM | 0.8834 |
-| Bloom Macro F1 | 0.8098 |
-| ERI Macro F1 | 0.8840 |
-| ECE | 0.0005 |
-| MoE Utilisation | 1.0000 |
-
-### v2 to v3 comparison
-
-| Metric | v2 | v3 | Change |
-|---|---|---|---|
-| Valid RMSE | 0.1018 | **0.0716** | -30% |
-| Valid R² | 0.952 | **0.9761** | +3% |
-| Valid SSIM | 0.927 | **0.9741** | +5% |
-| Forecast +1 RMSE | 0.1315 | **0.1180** | -10% |
-| Forecast +1 SSIM | 0.889 | 0.8834 | -1% |
-| ERI Macro F1 | 0.687 | **0.8840** | +29% |
-| ECE | 0.0002 | 0.0005 | +150% |
-| Expert utilisation | 1.000 | 1.0000 | -- |
+</details>
 
 ## Model outputs
 
@@ -109,6 +96,8 @@ Additionally, `compute_ecosystem_impact()` derives a per-pixel 0-1 ecosystem imp
 
 ## Architecture
 
+![MM-MARAS v3.4 Architecture](figures/architecture.png)
+
 ```
 optical (chl_obs + obs_mask)      --> OpticalEncoder   (Swin-UNet, 2ch)  --\                                          skip to ReconHead
 physics + wind + static          --> PhysicsEncoder    (Swin-UNet, 12ch) --\                                               |
@@ -119,19 +108,21 @@ discharge                        --> DischargeEncoder  (Swin-UNet, 2ch)  --/
 
 **Encoders.** All four spatial encoders reuse the same Swin-UNet backbone (patch embed, 3-stage encoder, bottleneck, 3-stage decoder with skip connections) with independent weights. Gradient checkpointing wraps each encoder's forward pass to trade compute for ~40% activation memory savings. Stage dimensions: 64, 128, 256; window sizes: 8, 8, 4. The physics encoder concatenates ocean state (6ch), wind/atmosphere (4ch), and static context (2ch, broadcast over time) into 12 channels. MaskNet classifies pixels into five missingness types via learned embeddings, propagates context through two rounds of masked grid-graph convolution, and mixes across time with depthwise temporal convolution.
 
-**Fusion.** Perceiver IO with 64 latent queries cross-attending to spatially pooled tokens from all five streams (1280 KV tokens). Self-attention refinement, then decode back to full resolution via position-aware spatial queries with residual blend.
+**Fusion.** Perceiver IO with 64 latent queries cross-attending to spatially pooled tokens from all five streams (1280 KV tokens). Cross-attention uses FP32 for numerical stability under AMP. Self-attention refinement, then decode back to full resolution via position-aware spatial queries with residual blend. Activation clamping (±50) after each residual addition prevents overflow.
 
-**Temporal (v3).** Two stacked ConvLSTM layers with gradient checkpointing. Layer 1 returns the full hidden sequence (B, T, D, H, W); layer 2 processes it with global-context bias to produce the final state (B, D, H, W). The final state is then enriched via TemporalReconAttention: 4-head cross-attention from the last-timestep query to the full layer-1 sequence, using cosine similarity with learnable temperature, L2-normalized Q/K, and obs_mask-weighted spatial pooling. Gap pixels at the last timestep attend to previously observed timesteps to recover context lost during temporal encoding.
+**Temporal.** Two stacked ConvLSTM layers. Layer 1 returns the full hidden sequence (B, T, D, H, W); layer 2 processes it with GroupNorm-normalized global-context bias to produce the final state (B, D, H, W). Cell states clamped to ±5.0 to prevent FP16 overflow. The final state is enriched via TemporalReconAttention: 4-head cross-attention from the last-timestep query to the full layer-1 sequence, using cosine similarity with learnable temperature, L2-normalized Q/K, and obs_mask-weighted spatial pooling. Gap pixels at the last timestep attend to previously observed timesteps to recover context lost during temporal encoding.
 
-**Decoder.** Four expert ConvNets soft-blended per sample via global routing (average pool, MLP, softmax). Load-balancing auxiliary loss at weight 0.01.
+**Decoder.** Four expert ConvNets (Conv3×3 → GroupNorm → GELU → Dropout2d(0.1) → Conv3×3) soft-blended per sample via global routing (average pool, MLP, softmax). Load-balancing auxiliary loss at weight 0.01.
 
-**Heads (v3).** Reconstruction: mask-conditioned spatial head — fuses decoded features, optical encoder skip connection, and obs_mask (D×2+1 channels), then 3 dilated convolutions (dilation 1, 2, 4; 9×9 effective receptive field), then 1×1 projection. Forecast: two-stage — (1) parallel prediction via shared 2-layer trunk + per-step projections, then (2) autoregressive ConvGRU refinement unrolled over 5 steps (D//4 channels, corrections clamped to [-1, 1]). Uncertainty: 1×1 conv (unchanged). ERI: takes decoded features + bloom count (bloom_mask.sum(dim=1) / 10) as extra input channel; Conv2d(D+1 → D//2 → 5) with GroupNorm. Bloom forecast: shared trunk + per-step binary outputs (unchanged). Total: ~44.4M parameters.
+**Heads.** All heads use Dropout2d(0.2) for regularization. Reconstruction: mask-conditioned spatial head — fuses decoded features, optical encoder skip connection, and obs_mask (D×2+1 channels), then 4 dilated convolutions (dilation 1, 2, 4, 8; 25×25 effective receptive field), then 1×1 projection. Forecast: two-stage — (1) parallel prediction via shared 2-layer trunk + per-step projections, then (2) autoregressive ConvGRU refinement unrolled over 5 steps (D//4 channels, corrections clamped to [-1, 1]). Uncertainty: 1×1 conv, output clamped to [-3, 10]. ERI: predicts from decoded features only (no label leakage); Conv2d(D → D//2 → 5) with GroupNorm + Dropout2d. Bloom forecast: shared trunk + per-step binary outputs. Total: ~44.4M parameters.
 
-**v3 architectural fixes (current code).** Four targeted improvements over the v2 training run:
-- [A] ReconHead: dilated 3×3/5×5 convolutions conditioned on `obs_mask`; skip connection from optical encoder → improves gap RMSE/SSIM.
-- [B] Temporal attention in ReconHead: cross-attends to the full ConvLSTM hidden sequence → recovers information from earlier timesteps for gap pixels.
-- [C] Autoregressive forecast refinement: lightweight GRU refines each forecast step conditioned on the previous prediction → fixes SSIM non-monotonicity at longer horizons.
-- [D] ERI head receives `bloom_mask.sum(dim=1)` directly as an extra input channel → improves ERI class 1 F1.
+**Architectural evolution.** Key changes from v2:
+- [A] ReconHead: dilated convolutions conditioned on `obs_mask` with optical encoder skip connection (was 1×1 conv)
+- [B] Temporal recon attention: cross-attends to full ConvLSTM hidden sequence (recovers context for gap pixels)
+- [C] Autoregressive forecast refinement: ConvGRU refines each step conditioned on previous prediction
+- [D] ERI head predicts from learned features only (v3.1 removed bloom_count input that caused label leakage)
+- [E] FP16 stability: FP32 attention matmul, activation clamping, frozen GradScaler at 8192 (v3.2)
+- [F] Regularization: Dropout2d(0.2) in all heads, Dropout2d(0.1) in MoE experts (v3.3/v3.4)
 
 ## Repository layout
 
@@ -169,9 +160,12 @@ sea-you-again/
 │       ├── physics_encoder.py    Ocean state + wind + static encoder (12ch input)
 │       ├── bgc_encoder.py        BGC auxiliary encoder (o2, no3, po4, si, nppv)
 │       └── discharge_encoder.py  River discharge + runoff encoder (dis24, rowe)
-└── scripts/
-    ├── Train.py              Training loop (single-GPU, DDP, AMP, curriculum)
-    └── eval.py               Test-set evaluation, bloom forecast metrics, ecosystem impact
+├── scripts/
+│   ├── Train.py              Training loop (single-GPU, DDP, AMP, curriculum, early stopping)
+│   ├── eval.py               Test-set evaluation, bloom forecast metrics, ecosystem impact
+│   └── architecture_diagram.py  Generate model architecture diagram
+└── figures/
+    └── architecture.png      MM-MARAS v3.4 architecture diagram
 ```
 
 ---
@@ -244,15 +238,15 @@ Optional: `pip install xesmf` for conservative regridding.
 
 ### Losses
 
-Six loss terms with curriculum scheduling (forecast, ERI, and bloom losses ramped in over first 20% of training):
+Six loss terms with curriculum scheduling (secondary losses ramped from 0 → 1.0 over the first 60% of training). All losses computed in FP32 under AMP. Per-component clamping at 5.0 prevents outlier batches from corrupting optimizer moments.
 
 | Loss | Weight | Description |
 |---|---|---|
-| Reconstruction | 1.0 | Heteroscedastic NLL on observed ocean pixels |
-| Holdout recon | 0.5 | NLL + Laplacian gradient matching on held-out pixels |
-| Forecast | 0.5 | Masked Huber (delta=0.5) over forecast window |
-| ERI | 0.3 | Focal ordinal cross-entropy (gamma=2.0) |
-| Bloom forecast | 0.3 | Binary CE with pos_weight=20 per forecast step |
+| Reconstruction | 1.0 | Heteroscedastic NLL on observed ocean pixels (log_var floor -3) |
+| Holdout recon | 0.8 | NLL + Laplacian gradient matching + L1 bias on held-out pixels |
+| Forecast | 0.5 | Masked Huber (delta=0.5) + SSIM (weight 0.2) over forecast window |
+| ERI | 0.3 | Focal ordinal cross-entropy (gamma=2.0, class 1 weight 8.0) |
+| Bloom forecast | 0.3 | Binary CE with pos_weight=10 per forecast step |
 | MoE auxiliary | 0.01 | Load-balancing (Switch Transformer) |
 
 ### Data augmentation
@@ -261,61 +255,41 @@ Random flips (horizontal p=0.5, vertical p=0.5) and 90° rotations (p=0.5) appli
 
 ### Training
 
-**v3 (current):**
+**v3.4 (current):**
 
 ```bash
-# Phase 1: 50 epochs at lr=1e-4
 torchrun --nproc_per_node=2 scripts/Train.py \
-    --patch-dir data-preprocessing-pipeline/data/patches --batch-size 4 --epochs 50 --lr 1e-4 --warmup-epochs 5
-
-# Phase 2: fine-tune 30 more at lr=3e-5 (epochs 50-79, best at epoch 58)
-torchrun --nproc_per_node=2 scripts/Train.py \
-    --patch-dir data-preprocessing-pipeline/data/patches --resume checkpoints/best.pt \
-    --batch-size 4 --epochs 80 --lr 3e-5 --warmup-epochs 5
+    --patch-dir data-preprocessing-pipeline/data/patches \
+    --batch-size 4 --epochs 50 --warmup-epochs 5 \
+    --bloom-oversample 3
 ```
 
-Peak VRAM: ~7.1 GB per T4 GPU with AMP and gradient checkpointing.
+Single-phase training: lr=5e-5, weight_decay=2e-2, cosine LR with 5-epoch linear warmup. Early stopping with patience 12. GradScaler frozen at init_scale=8192 (growth_interval=100,000 exceeds total steps). Best checkpoint typically at epoch 9-15. Peak VRAM: ~7.7 GB per T4 GPU with AMP and gradient checkpointing. ~500 seconds per epoch on 2×T4.
 
-<details>
-<summary>v2 training (for reference)</summary>
+### Post-hoc calibration
 
-```bash
-# Phase 1: 60 epochs at lr=1e-4
-torchrun --nproc_per_node=2 scripts/Train.py \
-    --patch-dir data-preprocessing-pipeline/data/patches --batch-size 4 --epochs 60 --lr 1e-4 --warmup-epochs 10
-
-# Phase 2: fine-tune 25 more at lr=5e-5
-torchrun --nproc_per_node=2 scripts/Train.py \
-    --patch-dir data-preprocessing-pipeline/data/patches --resume checkpoints/best.pt \
-    --batch-size 4 --epochs 85 --lr 5e-5 --warmup-epochs 5
-```
-
-Peak VRAM: ~10.6 GB per T4 GPU. ~218 seconds per epoch.
-</details>
-
-### Evaluation
+Run calibration first (on val set), then evaluation (on test set):
 
 ```bash
-python scripts/eval.py --ckpt checkpoints/best.pt --patch-dir data-preprocessing-pipeline/data/patches --out-dir eval_results
-```
-
-Outputs: `metrics.json`, `confusion_matrix.csv`, `calibration.csv`, and `figures/` containing reconstruction panels, forecast panels, bloom probability + ecosystem impact maps, calibration diagram, and routing bar chart.
-
-Reported metrics: reconstruction (RMSE, MAE, bias, R², SSIM, CRPS over all/valid/gap subsets), forecast (RMSE, MAE, SSIM per horizon), ERI (accuracy, macro-F1, per-class F1, ordinal MAE), uncertainty (ECE, variance-error correlation), MoE routing (per-expert weights, entropy, utilization), bloom forecast (per-step precision, recall, F1), and ecosystem impact (mean, percentiles, high-impact fraction).
-
-### Post-hoc calibration (v3)
-
-`model/calibrate.py` computes post-training corrections applied at inference time (no retraining required):
-
-1. **Gap bias correction**: The model over-predicts on gap (cloud-masked) pixels. `calibrate.py` measures the mean bias on the validation set; `eval.py` subtracts the calibrated GAP_BIAS (0.3860) from gap pixel predictions.
-2. **Bloom threshold optimization**: The default bloom classification threshold (0.5) is replaced with a calibrated threshold of 0.90, found by sweeping thresholds to maximize F1. This trades recall for substantially improved precision.
-
-```bash
+# Step 1: Calibrate — finds gap bias and optimal bloom threshold
 python model/calibrate.py \
     --ckpt checkpoints/best.pt \
     --patch-dir data-preprocessing-pipeline/data/patches \
     --out-dir calibration_results
+
+# Step 2: Evaluate — pass calibrated gap bias from step 1
+python scripts/eval.py \
+    --ckpt checkpoints/best.pt \
+    --patch-dir data-preprocessing-pipeline/data/patches \
+    --out-dir eval_results \
+    --gap-bias <VALUE_FROM_CALIBRATE>
 ```
+
+**Gap bias correction**: The model systematically over-predicts on gap (cloud-masked) pixels. `calibrate.py` measures the mean bias on the validation set; `eval.py --gap-bias` subtracts it from gap predictions at inference. The bias varies per model version — always re-calibrate after retraining.
+
+**Bloom threshold**: The default sigmoid threshold (0.5) is replaced with a calibrated threshold of 0.85 (hardcoded in eval.py), found by sweeping thresholds to maximize F1 on the validation set.
+
+Outputs: `metrics.json`, `confusion_matrix.csv`, `calibration.csv`, and `figures/` containing reconstruction panels, forecast panels, bloom probability + ecosystem impact maps, calibration diagram, and routing bar chart.
 
 ### Smoke tests
 
@@ -332,7 +306,7 @@ python model/encoders/physics_encoder.py   python model/encoders/bgc_encoder.py 
 
 ### Bloom lead-time prediction
 
-The `BloomForecastHead` predicts bloom probability at each of the 5 forecast steps (t+1 through t+5 days). Trained with binary cross-entropy (pos_weight=20 for extreme bloom rarity). Targets derived from forecast Chl-a at 10 mg/m³ (10.85 in normalized space).
+The `BloomForecastHead` predicts bloom probability at each of the 5 forecast steps (t+1 through t+5 days). Trained with binary cross-entropy (pos_weight=10 for extreme bloom rarity, ~1.2% positive rate). Targets derived from forecast Chl-a exceeding the bloom threshold (2.5 in normalized z-score space).
 
 ```python
 bloom_probs = torch.sigmoid(outputs["bloom_forecast"])  # (B, 5, H, W)
@@ -369,12 +343,14 @@ A single inference pass produces: bloom probability timeline (5 maps, one per fu
 ## Notes
 
 - Training loss goes negative because heteroscedastic NLL drives below zero with well-calibrated uncertainty. This is expected.
-- 30% of observed pixels are randomly held out during training for gap-filling supervision.
+- 30% of observed pixels are held out via structured elliptical cloud gaps during training for gap-filling supervision.
 - Validation gap RMSE uses a deterministic holdout mask (SHA-1 hash seed) for reproducibility.
 - `eval.py` forces routing weight collection in eval mode for post-training analysis.
 - The optical encoder supports optional SatMAE weight initialization via `load_satmae_patch_embed()`.
 - The contrastive pre-alignment loss in `fusion.py` is available for an optional pretraining phase.
 - All pipeline downloads are resumable. Normalization statistics are training-split-only.
-- v2 checkpoints are not compatible with v1 (new heads, different forecast head architecture). v3 checkpoints are not compatible with v2 (new ReconHead, ForecastHead, ERIHead, and TemporalModuleV3 signatures).
-- v3 eval.py applies GAP_BIAS=0.3860 correction on gap pixels and uses bloom threshold 0.90 (was 0.5). Re-run `calibrate.py` after retraining to update these values.
+- Checkpoint compatibility: v2 ≠ v1 (new heads), v3 ≠ v2 (new ReconHead, ForecastHead, ERIHead, TemporalModuleV3), v3.2 ≠ v3.1 (seq_norm GroupNorm added). v3.3/v3.4 are weight-compatible with v3.2 (hyperparameter changes only).
+- Gap SSIM ≈ 0 is a metric limitation, not a model failure: gap pixels are scattered (cloud-masked) with no spatial structure for SSIM to measure. Gap RMSE and MAE are the meaningful gap quality metrics.
+- `eval.py --gap-bias` accepts a calibrated gap bias value. Always re-run `calibrate.py` after retraining.
 - cuFFT/cuDNN/cuBLAS registration warnings during Kaggle DDP training are harmless.
+- T4 GPUs do not support BF16 — the model uses FP16 with all numerically sensitive operations forced to FP32.
