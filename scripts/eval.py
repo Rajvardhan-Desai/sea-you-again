@@ -583,7 +583,7 @@ class BloomForecastAccumulator:
         ocean = (1.0 - land_mask.float()).unsqueeze(1)
         valid = (target_mask.float() * ocean).bool().cpu()
         bloom_probs = torch.sigmoid(bloom_logits.float().cpu())
-        pred_bloom = (bloom_probs > 0.90)    # calibrated threshold (was 0.5)
+        pred_bloom = (bloom_probs > 0.85)    # [v3.4] calibrated threshold (was 0.90)
         true_bloom = (target_chl.float().cpu() > self.bloom_threshold)
 
         for h in range(self.h_fcast):
