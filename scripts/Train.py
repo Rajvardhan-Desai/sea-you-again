@@ -148,8 +148,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--resume",       default=None,            help="Path to checkpoint to resume from")
     p.add_argument("--epochs",        type=int,   default=50)
     p.add_argument("--batch-size",    type=int,   default=4)
-    p.add_argument("--lr",            type=float, default=3e-5)   # [v3.3] 1e-4→3e-5: slower to prevent overfitting
-    p.add_argument("--weight-decay",  type=float, default=5e-2)  # [v3.3] 1e-2→5e-2: stronger regularization
+    p.add_argument("--lr",            type=float, default=5e-5)   # [v3.4] 3e-5→5e-5: v3.3 too slow for secondary tasks
+    p.add_argument("--weight-decay",  type=float, default=2e-2)  # [v3.4] 5e-2→2e-2: v3.3 over-regularized with dropout
     p.add_argument("--grad-clip",     type=float, default=1.0)
     p.add_argument("--warmup-epochs", type=int,   default=5)
     p.add_argument("--save-every",    type=int,   default=10)
@@ -609,7 +609,7 @@ def main() -> None:
     MAX_NAN_EPOCHS    = 3   # [v3.1] stop training after 3 consecutive NaN val epochs
     # [v3.3] Early stopping — model peaked at epoch 5/50 last run (severe overfitting)
     no_improve_count  = 0
-    EARLY_STOP_PATIENCE = 10
+    EARLY_STOP_PATIENCE = 12  # [v3.4] 10→12: give slower curriculum more room
 
     if args.resume:
         start_epoch, global_step, best_val_loss = load_checkpoint(

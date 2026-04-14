@@ -60,6 +60,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--no-figures",  action="store_true",    help="Skip all figure generation")
     p.add_argument("--no-amp",      action="store_true")
     p.add_argument("--device",      default=None)
+    p.add_argument("--gap-bias",    type=float, default=0.0,
+                   help="Gap bias correction (run calibrate.py first to get this value)")
     return p.parse_args()
 
 
@@ -840,9 +842,9 @@ def evaluate(args: argparse.Namespace) -> None:
             bloom_mask = batch["bloom_mask"]
 
             # --- Gap bias correction (calibrated on val set) ---
-            # The model systematically over-predicts in gap regions by ~0.3860.
-            # Correct by subtracting the bias magnitude from gap pixels only.
-            GAP_BIAS = 0.3860
+            # Run calibrate.py first, then pass its gap_bias value here.
+            # Default 0.0 = no correction (safe for any model version).
+            GAP_BIAS = args.gap_bias
             ocean = 1.0 - land_mask
             gap_mask = (1.0 - obs_mask_t) * ocean       # (B, H, W)
             recon_corrected = outputs["recon"].clone()
