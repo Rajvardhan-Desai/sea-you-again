@@ -1,5 +1,9 @@
 """
-model.py — MM-MARAS top-level model (v3.3)
+model.py — MM-MARAS top-level model (v3.4)
+
+Changes from v3.3:
+    [v3.4] holdout_frac 0.40 → 0.30: revert, combined with dropout was too aggressive
+    [v3.4] Keep Dropout(0.2) in all heads (v3.3) — validated with reduced weight decay
 
 Changes from v3.2:
     [v3.3] Dropout(0.2) in ReconHead, ForecastHead, ERIHead, BloomForecastHead
@@ -84,7 +88,7 @@ class ModelConfig:
     embed_dim: int = 256
     n_experts: int = 4
     n_eri_levels: int = 5
-    holdout_frac: float = 0.40  # [v3.3] 0.30→0.40: more gap-fill training signal
+    holdout_frac: float = 0.30  # [v3.4] 0.40→0.30: revert, 0.40 + dropout was too aggressive
 
 
 # ======================================================================

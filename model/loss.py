@@ -1,5 +1,10 @@
 """
-loss.py — MM-MARAS loss functions (v3.3)
+loss.py — MM-MARAS loss functions (v3.4)
+
+Changes from v3.3:
+    [v3.4] curriculum_frac 1.0 → 0.60: v3.3 was too slow (secondary tasks
+           never reached full weight at best epoch 43/50). 0.60 = full weight
+           at epoch 30, balancing v3.2's too-fast 0.40 and v3.3's too-slow 1.0.
 
 Changes from v3.2:
     [v3.3] curriculum_frac 0.40 → 1.0: ramp secondary losses over full training
@@ -464,7 +469,7 @@ class MARASSLoss(nn.Module):
     def __init__(
         self,
         weights: LossWeights | None = None,
-        curriculum_frac: float = 1.0,   # [v3.3] 0.40→1.0: ramp over full training to prevent overfitting
+        curriculum_frac: float = 0.60,  # [v3.4] 1.0→0.60: v3.3 too slow, secondary tasks starved
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
         bloom_threshold: float = 0.0,
