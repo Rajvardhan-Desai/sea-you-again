@@ -93,25 +93,44 @@ class ExpertBlock(nn.Module):
 
 class Router(nn.Module):
     """
-    Computes per-sample expert routing weights from global features.
+    Computes coarse per-pixel expert routing weights.
+
+    v3.5: Routing is now spatial — different regions of a patch can select
+    different experts (e.g. coast vs. open ocean vs. bloom front). The old
+    sample-level global router produced routing_entropy ≈ log(4) = 1.386
+    in v3.4, indicating experts were not specializing at all.
+
+    Implementation: pool features to pool_size × pool_size for O(64) attention
+    footprint, apply a small conv router, softmax over experts, bilinearly
+    upsample to full resolution.
 
     Input:  state  (B, D, H, W)
-    Output: weights  (B, n_experts)   softmax probabilities
+    Output:
+        spatial_weights: (B, n_experts, H, W)  per-pixel softmax weights
+        global_weights:  (B, n_experts)        spatial mean (for aux loss / logging)
     """
 
-    def __init__(self, dim: int, n_experts: int) -> None:
+    def __init__(self, dim: int, n_experts: int, pool_size: int = 8) -> None:
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)         # (B, D, 1, 1)
-        self.fc = nn.Sequential(
-            nn.Linear(dim, dim // 4),
+        self.pool_size = pool_size
+        self.n_experts = n_experts
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, dim // 4),
             nn.GELU(),
-            nn.Linear(dim // 4, n_experts),
+            nn.Conv2d(dim // 4, n_experts, kernel_size=1),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        feat = self.pool(x).flatten(1)              # (B, D)
-        logits = self.fc(feat)                      # (B, n_experts)
-        return logits.softmax(dim=-1)               # (B, n_experts)
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        B, D, H, W = x.shape
+        coarse = F.adaptive_avg_pool2d(x, self.pool_size)          # (B, D, p, p)
+        logits = self.net(coarse)                                  # (B, E, p, p)
+        logits = F.interpolate(
+            logits, size=(H, W), mode="bilinear", align_corners=False,
+        )                                                           # (B, E, H, W)
+        spatial_weights = logits.softmax(dim=1)
+        global_weights = spatial_weights.mean(dim=(-1, -2))         # (B, E)
+        return spatial_weights, global_weights
 
 
 # ======================================================================
@@ -215,12 +234,14 @@ class MoEDecoder(nn.Module):
             decoded:         (B, D, H, W)
             routing_weights: (B, n_experts)  only if return_routing=True
         """
-        routing_weights = self.router(state)                # (B, n_experts)
+        spatial_weights, routing_weights = self.router(state)
+        # spatial_weights: (B, n_experts, H, W) — per-pixel soft gate
+        # routing_weights: (B, n_experts)      — spatial mean for logging / aux loss
 
-        # Compute all expert outputs and blend
+        # Compute all expert outputs and blend per-pixel
         out = torch.zeros_like(state)
         for e, expert in enumerate(self.experts):
-            w = routing_weights[:, e].view(-1, 1, 1, 1)    # (B, 1, 1, 1)
+            w = spatial_weights[:, e:e+1]                   # (B, 1, H, W)
             out = out + w * expert(state)
 
         out = self.out_norm(out)
