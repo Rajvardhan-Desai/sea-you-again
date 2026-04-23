@@ -1,5 +1,16 @@
 """
-model.py — MM-MARAS top-level model (v3.4)
+model.py — MM-MARAS top-level model (v3.5)
+
+Changes from v3.4:
+    [v3.5] ReconHead: added dilation=16 block (RF 31→63) + GlobalContextBlock
+           for patch-wide attention. Gap RMSE 0.83 was being caused by
+           interior gap pixels having no observable context within RF=31.
+    [v3.5] ERIHead: dilated stack + global context pooling (was 3x3 RF
+           with no global pooling — could not see bloom extent, class 2
+           F1 = 0.000).
+    [v3.5] ForecastHead: correction clamp [-1,1] → [-2.5,2.5]; GRU dim
+           D//4 → D//2 (64 → 128); split parallel trunks for near/far
+           horizons (steps 1-2 vs 3-5 have different error distributions).
 
 Changes from v3.3:
     [v3.4] holdout_frac 0.40 → 0.30: revert, combined with dropout was too aggressive
@@ -92,6 +103,58 @@ class ModelConfig:
 
 
 # ======================================================================
+# [v3.5] Global-context block for patch-wide attention
+# ======================================================================
+
+class GlobalContextBlock(nn.Module):
+    """
+    Lightweight non-local block. Pools features to pool_size x pool_size,
+    runs single-head self-attention, bilinearly upsamples back, residual adds.
+
+    Purpose: let every pixel (including gap interiors) attend to valid
+    observations anywhere in the patch — attention reach is O(patch),
+    independent of the surrounding convolutions' receptive field.
+
+    Runs in FP32 for numerical stability under AMP (softmax + matmul).
+    """
+
+    def __init__(self, channels: int, pool_size: int = 16, num_heads: int = 1) -> None:
+        super().__init__()
+        self.pool_size = pool_size
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+
+        self.q_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.k_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.v_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.out_proj = nn.Conv2d(channels, channels, 1)
+        # Learned pos embedding on the pooled grid — sinusoidal is overkill here
+        self.pos = nn.Parameter(torch.zeros(1, channels, pool_size, pool_size))
+        self.norm = nn.GroupNorm(8, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_dtype = x.dtype
+        B, C, H, W = x.shape
+        with torch.amp.autocast("cuda", enabled=False):
+            xf = x.float()
+            # Pool to pool_size x pool_size for a fixed-cost attention
+            p = F.adaptive_avg_pool2d(xf, self.pool_size) + self.pos.float()
+            q = self.q_proj(p).reshape(B, self.num_heads, self.head_dim, -1).transpose(-1, -2)
+            k = self.k_proj(p).reshape(B, self.num_heads, self.head_dim, -1).transpose(-1, -2)
+            v = self.v_proj(p).reshape(B, self.num_heads, self.head_dim, -1).transpose(-1, -2)
+            attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            attn = attn.clamp(min=-50.0, max=50.0).softmax(dim=-1)
+            out = (attn @ v).transpose(-1, -2).reshape(B, C, self.pool_size, self.pool_size)
+            out = self.out_proj(out)
+            # Upsample back to input resolution
+            out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
+            # Residual + norm
+            out = self.norm(xf + out)
+        return out.to(orig_dtype)
+
+
+# ======================================================================
 # [FIX A] Mask-aware spatial ReconHead with skip connection
 # ======================================================================
 
@@ -131,7 +194,7 @@ class ReconHead(nn.Module):
             nn.GELU(),
         )
 
-        # Multi-scale spatial propagation (cumulative RF: 25x25)
+        # Multi-scale spatial propagation (cumulative RF: 63x63 after v3.5)
         self.spatial = nn.Sequential(
             # Standard 3x3 — immediate neighbors (RF: 3x3)
             nn.Conv2d(D, D, kernel_size=3, padding=1, bias=False),
@@ -145,12 +208,22 @@ class ReconHead(nn.Module):
             nn.Conv2d(D // 2, D // 4, kernel_size=3, padding=4, dilation=4, bias=False),
             nn.GroupNorm(8, D // 4),
             nn.GELU(),
-            # [v3.1] Dilated 3x3 (dilation=8) — (RF: 25x25)
-            # Reaches 12 pixels from gap boundary — covers most real cloud gaps
+            # [v3.1] Dilated 3x3 (dilation=8) — (RF: 31x31)
             nn.Conv2d(D // 4, D // 4, kernel_size=3, padding=8, dilation=8, bias=False),
             nn.GroupNorm(8, D // 4),
             nn.GELU(),
+            # [v3.5] Dilated 3x3 (dilation=16) — (RF: 63x63, ≈ full 64x64 patch).
+            # Gap RMSE 0.83 → ~0.55 target: interior gap pixels in large
+            # cloud masks had no observable context within the old RF=31.
+            nn.Conv2d(D // 4, D // 4, kernel_size=3, padding=16, dilation=16, bias=False),
+            nn.GroupNorm(8, D // 4),
+            nn.GELU(),
         )
+
+        # [v3.5] Patch-wide attention — any gap pixel can attend to any
+        # valid pixel, regardless of convolutional RF. Cheap: 16x16 pooled
+        # tokens, single head, D//4 = 64 channels.
+        self.global_ctx = GlobalContextBlock(D // 4, pool_size=16, num_heads=1)
 
         self.out_proj = nn.Conv2d(D // 4, 1, kernel_size=1)
 
@@ -162,6 +235,7 @@ class ReconHead(nn.Module):
         x = self.fuse(torch.cat([decoded, opt_skip, obs_mask], dim=1))
         x = self.drop(x)  # [v3.3]
         x = self.spatial(x)
+        x = self.global_ctx(x)      # [v3.5] patch-wide attention
         return self.out_proj(x)     # (B, 1, H, W)
 
 
@@ -274,27 +348,37 @@ class ForecastHead(nn.Module):
         super().__init__()
         D = cfg.embed_dim
         self.H_fcast = cfg.H_fcast
+        # [v3.5] Near-horizon (steps 1-2) vs. far-horizon (steps 3-5) use
+        # separate trunks. Error distributions differ sharply — near-horizon
+        # predictions are close to persistence; far-horizon must extrapolate.
+        self.near_horizon = 2
 
         # [v3.3] Dropout to combat overfitting
         self.drop = nn.Dropout2d(0.2)
 
-        # Stage 1: parallel prediction (shared trunk + per-step output)
-        self.trunk = nn.Sequential(
-            nn.Conv2d(D, D, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, D),
-            nn.GELU(),
-            nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, D // 2),
-            nn.GELU(),
-        )
+        def _make_trunk() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(D, D, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(8, D),
+                nn.GELU(),
+                nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(8, D // 2),
+                nn.GELU(),
+            )
+
+        # [v3.5] Two trunks: near (steps 1-2) and far (steps 3-5)
+        self.trunk_near = _make_trunk()
+        self.trunk_far = _make_trunk()
+
         self.step_heads = nn.ModuleList([
             nn.Conv2d(D // 2, 1, kernel_size=1)
             for _ in range(cfg.H_fcast)
         ])
 
         # Stage 2: autoregressive refinement
-        # ConvGRU cell: takes (prediction, hidden) → updated prediction
-        refine_dim = D // 4
+        # [v3.5] ConvGRU hidden dim D//4=64 → D//2=128. The old dim was
+        # insufficient to carry corrective state across 5 AR steps.
+        refine_dim = D // 2
         self.pred_embed = nn.Conv2d(1, refine_dim, kernel_size=3, padding=1)
         self.gru_z = nn.Conv2d(refine_dim * 2, refine_dim, 3, padding=1)
         self.gru_r = nn.Conv2d(refine_dim * 2, refine_dim, 3, padding=1)
@@ -314,9 +398,13 @@ class ForecastHead(nn.Module):
     def forward(self, decoded: Tensor) -> Tensor:
         B, D, H, W = decoded.shape
 
-        # Stage 1: parallel prediction
-        shared = self.drop(self.trunk(decoded))  # [v3.3]
-        parallel_preds = [head(shared) for head in self.step_heads]
+        # Stage 1: parallel prediction — separate trunks per horizon band
+        shared_near = self.drop(self.trunk_near(decoded))
+        shared_far = self.drop(self.trunk_far(decoded))
+        parallel_preds = [
+            self.step_heads[t](shared_near if t < self.near_horizon else shared_far)
+            for t in range(self.H_fcast)
+        ]
 
         # Stage 2: autoregressive refinement
         h = self.h_init(decoded)                      # warm start from decoded features
@@ -326,7 +414,9 @@ class ForecastHead(nn.Module):
             x = self.pred_embed(pred_t)                    # (B, refine_dim, H, W)
             h = self._gru_step(x, h)                       # (B, refine_dim, H, W)
             correction = self.refine_out(h)                # (B, 1, H, W)
-            correction = correction.clamp(-1.0, 1.0)       # prevent runaway corrections
+            # [v3.5] Clamp [-1,1] → [-2.5,2.5]. Old range was too tight once
+            # parallel predictions drifted at horizon +3; wasted GRU capacity.
+            correction = correction.clamp(-2.5, 2.5)
             refined.append(pred_t + correction)            # residual refinement
 
         return torch.cat(refined, dim=1)                   # (B, H_fcast, H, W)
@@ -357,25 +447,55 @@ class ERIHead(nn.Module):
     The ERI target is derived from bloom_mask.sum(dim=1) thresholded into
     5 bins — passing that same count as input made the task trivially
     circular. The head now predicts ERI purely from learned representations.
+
+    v3.5: Replaced single 3x3 conv with a dilated stack (RF 3 → 11) plus
+    global-average-pool context broadcast. The old head's 3x3 RF could not
+    see bloom extent — a single pixel on the coast looked identical to a
+    100-pixel bloom inland. Class 2 (bloom_count ≥ 3) F1 was 0.000 in v3.4
+    because the head had no access to regional density information.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         D = cfg.embed_dim
-        # [v3.3] Added dropout to combat overfitting
-        self.head = nn.Sequential(
-            nn.Conv2d(D, D // 2, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, D // 2),
+        D2 = D // 2
+        # [v3.5] Dilated local stack — RF 1 → 3 → 11
+        self.local = nn.Sequential(
+            nn.Conv2d(D, D2, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, D2),
             nn.GELU(),
             nn.Dropout2d(0.2),
-            nn.Conv2d(D // 2, cfg.n_eri_levels, kernel_size=1),
+            nn.Conv2d(D2, D2, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.GroupNorm(8, D2),
+            nn.GELU(),
         )
+        # [v3.5] Global context: pool → MLP → broadcast. Captures bloom
+        # density / extent summary that local convs cannot see.
+        self.global_mlp = nn.Sequential(
+            nn.Linear(D, D2),
+            nn.GELU(),
+            nn.Linear(D2, D2),
+        )
+        # [v3.5] Fuse local features with broadcast global context
+        self.fuse = nn.Sequential(
+            nn.Conv2d(D2 * 2, D2, kernel_size=1, bias=False),
+            nn.GroupNorm(8, D2),
+            nn.GELU(),
+            nn.Dropout2d(0.2),
+        )
+        self.out = nn.Conv2d(D2, cfg.n_eri_levels, kernel_size=1)
 
     def forward(self, decoded: Tensor) -> Tensor:
         """
         decoded: (B, D, H, W) — MoE decoder output
         """
-        return self.head(decoded)   # (B, 5, H, W)
+        B, D, H, W = decoded.shape
+        local = self.local(decoded)                       # (B, D/2, H, W)
+        gctx = F.adaptive_avg_pool2d(decoded, 1).flatten(1)   # (B, D)
+        gctx = self.global_mlp(gctx)                      # (B, D/2)
+        gctx = gctx.view(B, -1, 1, 1).expand(-1, -1, H, W)
+        x = self.fuse(torch.cat([local, gctx], dim=1))
+        return self.out(x)                                # (B, 5, H, W)
 
 
 # ======================================================================

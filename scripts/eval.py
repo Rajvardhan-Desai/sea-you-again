@@ -62,6 +62,13 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--device",      default=None)
     p.add_argument("--gap-bias",    type=float, default=0.0,
                    help="Gap bias correction (run calibrate.py first to get this value)")
+    p.add_argument("--bloom-thresholds", type=float, nargs="+", default=None,
+                   help="Per-horizon bloom thresholds (5 floats). Falls back to single 0.85 if omitted.")
+    p.add_argument("--tta", action="store_true",
+                   help="Enable 8-way test-time augmentation (flips × 4 rotations).")
+    p.add_argument("--mc-dropout", type=int, default=0,
+                   help="Number of MC-dropout passes (0 = disabled). Dropouts stay on, recon/forecast"
+                        " variance across passes gives epistemic uncertainty.")
     return p.parse_args()
 
 
@@ -564,9 +571,21 @@ class BloomForecastAccumulator:
     Bloom targets are derived from target_chl at a normalized threshold.
     """
 
-    def __init__(self, h_fcast: int, bloom_threshold: float = 2.5):
+    def __init__(
+        self,
+        h_fcast: int,
+        bloom_threshold: float = 2.5,
+        pred_thresholds: list[float] | None = None,
+    ):
         self.h_fcast = h_fcast
         self.bloom_threshold = bloom_threshold
+        if pred_thresholds is None:
+            pred_thresholds = [0.85] * h_fcast
+        if len(pred_thresholds) != h_fcast:
+            raise ValueError(
+                f"pred_thresholds must have length {h_fcast}, got {len(pred_thresholds)}"
+            )
+        self.pred_thresholds = list(pred_thresholds)
         self.tp = [0] * h_fcast
         self.fp = [0] * h_fcast
         self.fn = [0] * h_fcast
@@ -583,14 +602,14 @@ class BloomForecastAccumulator:
         ocean = (1.0 - land_mask.float()).unsqueeze(1)
         valid = (target_mask.float() * ocean).bool().cpu()
         bloom_probs = torch.sigmoid(bloom_logits.float().cpu())
-        pred_bloom = (bloom_probs > 0.85)    # [v3.4] calibrated threshold (was 0.90)
         true_bloom = (target_chl.float().cpu() > self.bloom_threshold)
 
         for h in range(self.h_fcast):
             m = valid[:, h]
             if not m.any():
                 continue
-            p = pred_bloom[:, h][m]
+            pred_bloom_h = bloom_probs[:, h] > self.pred_thresholds[h]
+            p = pred_bloom_h[m]
             t = true_bloom[:, h][m]
             self.tp[h] += int((p & t).sum())
             self.fp[h] += int((p & ~t).sum())
@@ -766,6 +785,118 @@ def forward_with_routing(model, batch):
 
 
 # ======================================================================
+# Test-time augmentation (8-way: {identity, hflip} × {rot0, rot90, rot180, rot270})
+# ======================================================================
+
+# Spatial keys in the batch: (B, ..., H, W). Flip/rotate in the last two dims.
+_TTA_SPATIAL_BATCH_KEYS = (
+    "chl_obs", "obs_mask", "mcar_mask", "mnar_mask", "bloom_mask",
+    "physics", "wind", "static", "discharge", "bgc_aux",
+    "land_mask", "target_chl", "target_mask",
+)
+
+# Output keys that are spatial maps and need inverse-transforming after TTA.
+_TTA_SPATIAL_OUT_KEYS = (
+    "recon", "uncertainty", "forecast", "eri", "bloom_forecast",
+)
+
+
+def _tta_apply(t: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
+    """Apply rotation (k*90°) then optional horizontal flip to the last two dims."""
+    out = torch.rot90(t, k=k, dims=(-2, -1))
+    if flip:
+        out = torch.flip(out, dims=(-1,))
+    return out
+
+
+def _tta_inverse(t: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
+    """Inverse of _tta_apply."""
+    if flip:
+        t = torch.flip(t, dims=(-1,))
+    return torch.rot90(t, k=-k, dims=(-2, -1))
+
+
+def forward_with_tta(model, batch: dict, forward_fn) -> tuple[dict, torch.Tensor]:
+    """
+    8-way TTA: {k=0,1,2,3 rotations} × {flip off, on}.
+
+    Averages recon/forecast in their native (log) space, bloom_forecast and
+    eri in logit space, uncertainty log-variance in log space. Routing weights
+    (scalar per sample per expert) are averaged directly.
+    """
+    transforms = [(k, flip) for k in range(4) for flip in (False, True)]
+    n = len(transforms)
+
+    accum_outputs: dict[str, torch.Tensor] = {}
+    accum_routing: torch.Tensor | None = None
+
+    for k, flip in transforms:
+        aug_batch = {}
+        for key, val in batch.items():
+            if key in _TTA_SPATIAL_BATCH_KEYS and isinstance(val, torch.Tensor):
+                aug_batch[key] = _tta_apply(val, k, flip)
+            else:
+                aug_batch[key] = val
+        outs, routing_w = forward_fn(model, aug_batch)
+
+        # Invert spatial outputs back to original orientation
+        for key, val in outs.items():
+            if key in _TTA_SPATIAL_OUT_KEYS and isinstance(val, torch.Tensor):
+                val = _tta_inverse(val, k, flip)
+            accum_outputs[key] = accum_outputs.get(key, 0) + val.float()
+
+        accum_routing = routing_w.float() if accum_routing is None else accum_routing + routing_w.float()
+
+    averaged = {k: v / n for k, v in accum_outputs.items()}
+    assert accum_routing is not None
+    return averaged, accum_routing / n
+
+
+# ======================================================================
+# MC-dropout (epistemic uncertainty via stochastic forward passes)
+# ======================================================================
+
+def _enable_dropout(model: torch.nn.Module) -> None:
+    """Put every Dropout/Dropout2d module in train() mode while keeping BN/etc. in eval."""
+    for m in model.modules():
+        if isinstance(m, (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d)):
+            m.train()
+
+
+def forward_with_mc_dropout(
+    model, batch: dict, forward_fn, n_passes: int,
+) -> tuple[dict, torch.Tensor, dict]:
+    """
+    Run n_passes stochastic forward passes with dropouts active. Returns:
+        mean outputs, mean routing_w, {name: epistemic_std} for recon & forecast.
+    """
+    model.eval()
+    _enable_dropout(model)
+
+    recon_samples = []
+    forecast_samples = []
+    accum_outputs: dict[str, torch.Tensor] = {}
+    accum_routing: torch.Tensor | None = None
+
+    for _ in range(n_passes):
+        outs, routing_w = forward_fn(model, batch)
+        recon_samples.append(outs["recon"].float())
+        forecast_samples.append(outs["forecast"].float())
+        for k, v in outs.items():
+            accum_outputs[k] = accum_outputs.get(k, 0) + v.float()
+        accum_routing = routing_w.float() if accum_routing is None else accum_routing + routing_w.float()
+
+    averaged = {k: v / n_passes for k, v in accum_outputs.items()}
+    assert accum_routing is not None
+    epistemic = {
+        "recon_std":    torch.stack(recon_samples,    dim=0).std(dim=0),
+        "forecast_std": torch.stack(forecast_samples, dim=0).std(dim=0),
+    }
+    model.eval()  # restore
+    return averaged, accum_routing / n_passes, epistemic
+
+
+# ======================================================================
 # Main
 # ======================================================================
 
@@ -813,13 +944,36 @@ def evaluate(args: argparse.Namespace) -> None:
     test_loader = loaders["test"]
     log.info(f"Test set: {len(test_loader)} batches")
 
+    # --- Per-horizon bloom thresholds (Block 6) ---
+    if args.bloom_thresholds is None:
+        bloom_thresholds = [0.85] * cfg.H_fcast
+    else:
+        if len(args.bloom_thresholds) != cfg.H_fcast:
+            raise ValueError(
+                f"--bloom-thresholds needs {cfg.H_fcast} floats, "
+                f"got {len(args.bloom_thresholds)}"
+            )
+        bloom_thresholds = list(args.bloom_thresholds)
+    log.info(f"Bloom thresholds (per horizon): {bloom_thresholds}")
+
+    if args.tta:
+        log.info("TTA enabled (8-way)")
+    if args.mc_dropout > 0:
+        log.info(f"MC-dropout enabled ({args.mc_dropout} passes)")
+
     recon_acc   = ReconAccumulator()
     fcast_acc   = ForecastAccumulator(cfg.H_fcast)
     eri_acc     = ERIAccumulator(cfg.n_eri_levels)
     uncert_acc  = UncertaintyAccumulator()
     routing_acc = RoutingAccumulator(cfg.n_experts)
-    bloom_acc   = BloomForecastAccumulator(cfg.H_fcast, bloom_threshold=2.5)
+    bloom_acc   = BloomForecastAccumulator(
+        cfg.H_fcast, bloom_threshold=2.5, pred_thresholds=bloom_thresholds,
+    )
     impact_acc  = EcosystemImpactAccumulator()
+
+    # Accumulators for MC-dropout epistemic std (optional)
+    mc_std_recon    = []
+    mc_std_forecast = []
 
     n_figs = 0
     n_batches = len(test_loader)
@@ -832,7 +986,20 @@ def evaluate(args: argparse.Namespace) -> None:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                outputs, routing_w = forward_with_routing(model, batch)
+                if args.mc_dropout > 0:
+                    outputs, routing_w, epistemic = forward_with_mc_dropout(
+                        model, batch, forward_with_routing, args.mc_dropout,
+                    )
+                    mc_std_recon.append(
+                        epistemic["recon_std"].float().cpu().mean().item()
+                    )
+                    mc_std_forecast.append(
+                        epistemic["forecast_std"].float().cpu().mean(dim=(0, 2, 3)).numpy()
+                    )
+                elif args.tta:
+                    outputs, routing_w = forward_with_tta(model, batch, forward_with_routing)
+                else:
+                    outputs, routing_w = forward_with_routing(model, batch)
 
             land_mask  = batch["land_mask"]
             obs_mask_t = batch["obs_mask"][:, -1]
@@ -1006,11 +1173,35 @@ def evaluate(args: argparse.Namespace) -> None:
         print(f"  High impact  : {impact_result['high_impact_frac']*100:.2f}% of ocean pixels (score > 0.6)")
     print("=" * 62)
 
+    # --- MC-dropout epistemic summary (Block 6) ---
+    mc_dropout_result = {}
+    if args.mc_dropout > 0 and mc_std_recon:
+        mc_fcast_arr = np.stack(mc_std_forecast, axis=0)  # (n_batches, H_fcast)
+        mc_dropout_result = {
+            "n_passes":       int(args.mc_dropout),
+            "recon_mean_std": float(np.mean(mc_std_recon)),
+            "forecast_mean_std_per_step": {
+                f"step_{h+1}": float(mc_fcast_arr[:, h].mean())
+                for h in range(cfg.H_fcast)
+            },
+        }
+        print("\n" + "=" * 62)
+        print(f"MC-DROPOUT EPISTEMIC UNCERTAINTY ({args.mc_dropout} passes)")
+        print("=" * 62)
+        print(f"  Recon mean std:    {mc_dropout_result['recon_mean_std']:.5f}")
+        for k, v in mc_dropout_result["forecast_mean_std_per_step"].items():
+            print(f"  Forecast {k} std:  {v:.5f}")
+        print("=" * 62)
+
     # --- Save outputs ---
     all_metrics = {
         "checkpoint":     str(args.ckpt),
         "epoch":          ckpt.get("epoch"),
         "val_loss":       ckpt.get("val_loss"),
+        "tta":            bool(args.tta),
+        "mc_dropout":     int(args.mc_dropout),
+        "bloom_thresholds": bloom_thresholds,
+        "gap_bias":       float(args.gap_bias),
         "reconstruction": recon_result,
         "forecast":       fcast_result,
         "eri":            eri_result,
@@ -1018,6 +1209,7 @@ def evaluate(args: argparse.Namespace) -> None:
         "routing":        routing_result,
         "bloom_forecast": bloom_result,
         "ecosystem_impact": impact_result,
+        "mc_dropout_epistemic": mc_dropout_result,
     }
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2)

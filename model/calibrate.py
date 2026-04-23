@@ -170,18 +170,50 @@ def apply_gap_bias_correction(pred, obs_mask, land_mask, bias):
 # [FIX 2] Bloom threshold optimization
 # ======================================================================
 
+def _sweep_thresholds(probs: np.ndarray, labels: np.ndarray) -> tuple[list[dict], float, float]:
+    """Sweep thresholds and return (sweep, best_threshold, best_f1)."""
+    thresholds = np.arange(0.1, 0.95, 0.05)
+    results = []
+    best_f1 = 0.0
+    best_thresh = 0.5
+    for t in thresholds:
+        pred = (probs >= t)
+        tp = int((pred & (labels == 1)).sum())
+        fp = int((pred & (labels == 0)).sum())
+        fn = int((~pred & (labels == 1)).sum())
+        tn = int((~pred & (labels == 0)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        results.append({
+            "threshold": float(t),
+            "precision": float(prec),
+            "recall":    float(rec),
+            "f1":        float(f1),
+            "fp_rate":   float(fpr),
+        })
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = float(t)
+    return results, best_thresh, best_f1
+
+
 def optimize_bloom_threshold(model, loader, device, use_amp, bloom_chl_threshold=2.5):
     """
-    Sweep classification thresholds to find the one that maximizes F1.
+    Sweep classification thresholds to find the one that maximizes F1,
+    BOTH globally (pooled across horizons) and per forecast horizon.
 
-    Default threshold is logit > 0 (prob > 0.5). With pos_weight=20 in
-    training, the model is biased toward predicting bloom, so a higher
-    threshold improves precision at the cost of some recall.
+    Per-horizon sweep lets eval.py apply a different threshold for each
+    lead step (+1 through +5), which is strictly at least as good as the
+    global threshold and usually better — short horizons are more confident
+    and tolerate higher thresholds, longer horizons are noisier.
     """
-    log.info("[FIX 2] Optimizing bloom classification threshold...")
+    log.info("[FIX 2] Optimizing bloom classification threshold (global + per horizon)...")
 
-    all_logits = []
-    all_labels = []
+    # Per-horizon storage so we can sweep independently.
+    per_h_logits: list[list[np.ndarray]] = [[] for _ in range(5)]
+    per_h_labels: list[list[np.ndarray]] = [[] for _ in range(5)]
 
     with torch.no_grad():
         for batch in loader:
@@ -205,83 +237,77 @@ def optimize_bloom_threshold(model, loader, device, use_amp, bloom_chl_threshold
             for h in range(5):
                 m = valid[:, h]
                 if m.any():
-                    all_logits.append(logits[:, h][m].numpy())
-                    all_labels.append(true_bloom[:, h][m].numpy().astype(np.float32))
+                    per_h_logits[h].append(logits[:, h][m].numpy())
+                    per_h_labels[h].append(true_bloom[:, h][m].numpy().astype(np.float32))
 
-    logits_flat = np.concatenate(all_logits)
-    labels_flat = np.concatenate(all_labels)
-    probs_flat = 1.0 / (1.0 + np.exp(-logits_flat))  # sigmoid
+    # Pooled (global) sweep — kept for backward compat / reporting.
+    logits_flat = np.concatenate([x for per in per_h_logits for x in per])
+    labels_flat = np.concatenate([x for per in per_h_labels for x in per])
+    probs_flat  = 1.0 / (1.0 + np.exp(-logits_flat))
 
     log.info(f"  Total pixels: {len(logits_flat):,}")
-    log.info(f"  Positive rate: {labels_flat.mean()*100:.3f}%")
+    log.info(f"  Positive rate (pooled): {labels_flat.mean()*100:.3f}%")
 
-    # Sweep thresholds
-    thresholds = np.arange(0.1, 0.95, 0.05)
-    results = []
+    sweep_global, best_thresh, best_f1 = _sweep_thresholds(probs_flat, labels_flat)
 
-    log.info(f"\n  {'Threshold':>10s}  {'Prec':>6s}  {'Rec':>6s}  {'F1':>6s}  {'FP rate':>8s}")
-    log.info(f"  {'-'*10}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*8}")
+    log.info("\n  GLOBAL sweep:")
+    log.info(f"  {'Thr':>6s}  {'Prec':>6s}  {'Rec':>6s}  {'F1':>6s}  {'FPR':>6s}")
+    for r in sweep_global:
+        marker = " <--" if abs(r["threshold"] - best_thresh) < 1e-6 else ""
+        log.info(f"  {r['threshold']:>6.2f}  {r['precision']:>6.3f}  "
+                 f"{r['recall']:>6.3f}  {r['f1']:>6.3f}  {r['fp_rate']:>6.4f}{marker}")
 
-    best_f1 = 0
-    best_thresh = 0.5
-
-    for t in thresholds:
-        pred = (probs_flat >= t).astype(float)
-        tp = ((pred == 1) & (labels_flat == 1)).sum()
-        fp = ((pred == 1) & (labels_flat == 0)).sum()
-        fn = ((pred == 0) & (labels_flat == 1)).sum()
-        tn = ((pred == 0) & (labels_flat == 0)).sum()
-
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-
-        results.append({
-            "threshold": float(t),
-            "precision": float(prec),
-            "recall": float(rec),
-            "f1": float(f1),
-            "fp_rate": float(fpr),
+    # Per-horizon sweep.
+    per_horizon: list[dict] = []
+    per_horizon_thresholds: list[float] = []
+    log.info("\n  PER-HORIZON sweep:")
+    log.info(f"  {'Horizon':>8s}  {'BestThr':>8s}  {'F1':>6s}  {'Prec':>6s}  {'Rec':>6s}  {'N+':>8s}")
+    for h in range(5):
+        if not per_h_logits[h]:
+            per_horizon_thresholds.append(best_thresh)
+            per_horizon.append({"step": h + 1, "best_threshold": best_thresh, "note": "no data"})
+            continue
+        logits_h = np.concatenate(per_h_logits[h])
+        labels_h = np.concatenate(per_h_labels[h])
+        probs_h  = 1.0 / (1.0 + np.exp(-logits_h))
+        sweep_h, thr_h, f1_h = _sweep_thresholds(probs_h, labels_h)
+        # Look up prec/rec at chosen threshold.
+        at = next(r for r in sweep_h if abs(r["threshold"] - thr_h) < 1e-6)
+        per_horizon_thresholds.append(thr_h)
+        per_horizon.append({
+            "step":           h + 1,
+            "best_threshold": thr_h,
+            "best_f1":        f1_h,
+            "precision":      at["precision"],
+            "recall":         at["recall"],
+            "n_positive":     int(labels_h.sum()),
+            "sweep":          sweep_h,
         })
+        log.info(f"  t+{h+1:<6d}  {thr_h:>8.2f}  {f1_h:>6.3f}  "
+                 f"{at['precision']:>6.3f}  {at['recall']:>6.3f}  {int(labels_h.sum()):>8,}")
 
-        marker = " <-- best" if f1 > best_f1 else ""
-        log.info(f"  {t:>10.2f}  {prec:>6.3f}  {rec:>6.3f}  {f1:>6.3f}  {fpr:>8.4f}{marker}")
-
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = t
-
-    # Find threshold for 70% precision target
+    # Threshold for 70% precision target (global).
     prec_target = 0.70
-    for r in results:
-        if r["precision"] >= prec_target:
-            thresh_70 = r["threshold"]
-            break
-    else:
-        thresh_70 = None
+    thresh_70 = next((r["threshold"] for r in sweep_global if r["precision"] >= prec_target), None)
 
-    log.info(f"\n  Optimal threshold (max F1):  {best_thresh:.2f}  "
-             f"(F1={best_f1:.3f})")
-    if thresh_70 is not None:
-        match = next(r for r in results if r["threshold"] == thresh_70)
-        log.info(f"  Threshold for >=70% precision: {thresh_70:.2f}  "
-                 f"(Prec={match['precision']:.3f}, Rec={match['recall']:.3f}, "
-                 f"F1={match['f1']:.3f})")
-
-    log.info(f"\n  Recommendation: use threshold={best_thresh:.2f} in eval.py")
-    log.info(f"  Change line: pred_bloom = (bloom_logits.float().cpu() > 0.0)")
-    log.info(f"  To:          pred_bloom = (bloom_probs > {best_thresh:.2f})")
-    log.info(f"  Where:       bloom_probs = torch.sigmoid(bloom_logits.float().cpu())")
+    log.info(f"\n  Global optimal threshold: {best_thresh:.2f}  (F1={best_f1:.3f})")
+    log.info(f"  Per-horizon thresholds:   {[round(t, 2) for t in per_horizon_thresholds]}")
+    log.info(f"\n  Use with eval.py:")
+    log.info(
+        "    python eval.py --ckpt ... --bloom-thresholds "
+        + " ".join(f"{t:.2f}" for t in per_horizon_thresholds)
+    )
 
     return {
-        "sweep": results,
-        "best_threshold": best_thresh,
-        "best_f1": best_f1,
-        "threshold_70_prec": thresh_70,
-        "default_f1_at_0.5": next(
-            (r["f1"] for r in results if abs(r["threshold"] - 0.5) < 0.03), 0
+        "sweep":              sweep_global,
+        "best_threshold":     best_thresh,
+        "best_f1":            best_f1,
+        "threshold_70_prec":  thresh_70,
+        "default_f1_at_0.5":  next(
+            (r["f1"] for r in sweep_global if abs(r["threshold"] - 0.5) < 0.03), 0,
         ),
+        "per_horizon":             per_horizon,
+        "per_horizon_thresholds":  per_horizon_thresholds,
     }
 
 
@@ -481,9 +507,14 @@ def main():
     print(f"          (Apply at inference: pred_corrected = pred - ({gap_result['bias']:.4f}) * gap_mask)")
     print(f"          Gap SSIM ~ 0 is a METRIC LIMITATION, not a model failure.")
     if bloom_result:
-        print(f"\n  [FIX 2] Optimal bloom threshold: {bloom_result['best_threshold']:.2f}")
-        print(f"          F1 at default 0.50: {bloom_result['default_f1_at_0.5']:.3f}")
-        print(f"          F1 at optimal:      {bloom_result['best_f1']:.3f}")
+        print(f"\n  [FIX 2] Optimal bloom threshold (global): {bloom_result['best_threshold']:.2f}")
+        print(f"          F1 at default 0.50:  {bloom_result['default_f1_at_0.5']:.3f}")
+        print(f"          F1 at optimal:       {bloom_result['best_f1']:.3f}")
+        if "per_horizon_thresholds" in bloom_result:
+            thrs = bloom_result["per_horizon_thresholds"]
+            print(f"          Per-horizon thresholds: {[round(t, 2) for t in thrs]}")
+            print(f"          Pass to eval.py:  --bloom-thresholds "
+                  + " ".join(f"{t:.2f}" for t in thrs))
     print(f"\n  [FIX 3] ERI class 1: {float(eri_result['class_fractions']['1'])*100:.2f}% of pixels")
     print(f"          Fix: oversample bloom patches + increase class 1 weight (retrain)")
     print(f"\n  [FIX 4] Forecast SSIM dip at step 3: sample-level variance")
