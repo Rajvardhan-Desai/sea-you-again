@@ -1,5 +1,14 @@
 """
-loss.py — MM-MARAS loss functions (v3.4)
+loss.py — MM-MARAS loss functions (v3.5)
+
+Changes from v3.4:
+    [v3.5] curriculum_frac 0.60 → 0.30: best checkpoint was landing at
+           epoch 9/50 when secondary curriculum_scale was still ~0.18, so
+           forecast / ERI / bloom heads were barely supervised at selection
+           time. Full secondary weight by epoch 18/60 lets post-curriculum
+           refinement drive the best-checkpoint selection.
+    [v3.5] ERI class weights [0.15, 8, 4, 4, 5] → [0.1, 10, 12, 6, 6]
+           to break class-2 collapse (was F1 = 0.000 in v3.4 eval).
 
 Changes from v3.3:
     [v3.4] curriculum_frac 1.0 → 0.60: v3.3 was too slow (secondary tasks
@@ -307,8 +316,11 @@ def eri_loss(
 
         # [v3.2] class 1 weight 15.0 → 8.0: still 53x above background (0.15),
         # but reduces gradient amplification that caused epoch 9-14 NaN cascade
+        # [v3.5] Bumped to break class-2 collapse (F1 was 0.000 in v3.4).
+        # Ratio preserves class 1 > 2 > 3,4 > 0 ordering but widens the gap
+        # between background and each minority class.
         class_weights = torch.tensor(
-            [0.15, 8.0, 4.0, 4.0, 5.0], device=logits.device, dtype=torch.float32
+            [0.1, 10.0, 12.0, 6.0, 6.0], device=logits.device, dtype=torch.float32
         )
         sample_weight = class_weights[target_long]
 
@@ -451,7 +463,8 @@ class LossWeights:
     forecast:    float = 0.5
     eri:         float = 0.3
     bloom_fcast: float = 0.3    # [FEAT 1] bloom lead-time prediction
-    aux:         float = 0.01   # [PERF 3] was 0.001 — fix expert collapse
+    aux:         float = 0.05   # [v3.5] 0.01→0.05: old weight was too small
+                                # to fight near-uniform routing (entropy≈log(4))
     holdout:     float = 0.8    # [v3] was 0.5 — stronger gap supervision
 
 
@@ -469,7 +482,7 @@ class MARASSLoss(nn.Module):
     def __init__(
         self,
         weights: LossWeights | None = None,
-        curriculum_frac: float = 0.60,  # [v3.4] 1.0→0.60: v3.3 too slow, secondary tasks starved
+        curriculum_frac: float = 0.30,  # [v3.5] 0.60→0.30: best ckpt landed at epoch 9 when scale was still ~0.18
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
         bloom_threshold: float = 0.0,
