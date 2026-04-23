@@ -18,6 +18,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import logging
@@ -86,6 +87,67 @@ def unwrap_model(model: nn.Module) -> MARASSModel:
     return model.module if isinstance(model, DDP) else model
 
 
+# ======================================================================
+# [v3.5] Exponential moving average of model weights
+# ======================================================================
+
+class ModelEMA:
+    """
+    Maintains an exponentially-decayed shadow copy of model parameters.
+
+    Update rule (per optimizer step):
+        shadow = decay * shadow + (1 - decay) * param
+
+    `apply_to(model)` is a context manager that temporarily swaps the model's
+    parameters with the shadow copy, for running validation on EMA weights.
+    Only `parameters()` are shadowed; buffers (BN running stats, etc.) are
+    left on the model — the ConvLSTM / Swin stack here has no running stats
+    that would drift, so buffer-shadowing would be overhead with no gain.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        src = unwrap_model(model)
+        for name, p in src.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        src = unwrap_model(model)
+        d = self.decay
+        for name, p in src.named_parameters():
+            if not p.requires_grad:
+                continue
+            s = self.shadow[name]
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @contextlib.contextmanager
+    def apply_to(self, model: nn.Module):
+        src = unwrap_model(model)
+        backup: dict[str, torch.Tensor] = {}
+        try:
+            for name, p in src.named_parameters():
+                if name in self.shadow:
+                    backup[name] = p.detach().clone()
+                    p.data.copy_(self.shadow[name])
+            yield
+        finally:
+            for name, p in src.named_parameters():
+                if name in backup:
+                    p.data.copy_(backup[name])
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.decay = sd["decay"]
+        for k, v in sd["shadow"].items():
+            if k in self.shadow:
+                self.shadow[k].copy_(v)
+
+
 class DistributedEvalSampler(Sampler[int]):
     def __init__(self, dataset: MARASSDataset, rank: int, world_size: int) -> None:
         self.start = (len(dataset) * rank) // world_size
@@ -146,7 +208,9 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--ckpt-dir",     default="checkpoints",   help="Checkpoint output directory")
     p.add_argument("--log-dir",      default="runs",          help="TensorBoard log directory")
     p.add_argument("--resume",       default=None,            help="Path to checkpoint to resume from")
-    p.add_argument("--epochs",        type=int,   default=50)
+    p.add_argument("--epochs",        type=int,   default=60)  # [v3.5] 50→60: post-curriculum refinement room
+    p.add_argument("--ema-decay",     type=float, default=0.999,
+                   help="[v3.5] EMA decay; set <=0 to disable")
     p.add_argument("--batch-size",    type=int,   default=4)
     p.add_argument("--lr",            type=float, default=5e-5)   # [v3.4] 3e-5→5e-5: v3.3 too slow for secondary tasks
     p.add_argument("--weight-decay",  type=float, default=2e-2)  # [v3.4] 5e-2→2e-2: v3.3 over-regularized with dropout
@@ -157,7 +221,7 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-recon",    type=float, default=1.0)
     p.add_argument("--w-forecast", type=float, default=0.5)
     p.add_argument("--w-eri",      type=float, default=0.3)
-    p.add_argument("--w-aux",      type=float, default=0.01)
+    p.add_argument("--w-aux",      type=float, default=0.05)  # [v3.5] 0.01→0.05: force expert specialization
     p.add_argument("--w-holdout",  type=float, default=0.8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None)
@@ -240,6 +304,7 @@ def run_epoch(
     use_amp: bool,
     world_size: int = 1,
     is_main: bool = True,
+    ema: ModelEMA | None = None,
 ) -> tuple[dict[str, float], int]:
     is_train = (phase == "train")
     amp_device = "cuda" if device.type == "cuda" else "cpu"
@@ -335,6 +400,8 @@ def run_epoch(
                 if stepped:
                     scheduler.step()
                     global_step += 1
+                    if ema is not None:
+                        ema.update(model)
 
                 if writer and is_main:
                     writer.add_scalar("train/loss",             breakdown["total"],    global_step)
@@ -435,6 +502,7 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     val_loss: float,
+    ema: ModelEMA | None = None,
 ) -> None:
     ckpt = {
         "epoch":       epoch,
@@ -446,6 +514,8 @@ def save_checkpoint(
     }
     if scaler is not None:
         ckpt["scaler"] = scaler.state_dict()
+    if ema is not None:
+        ckpt["ema"] = ema.state_dict()
     torch.save(ckpt, path)
     log.info(f"Saved checkpoint: {path}")
 
@@ -457,6 +527,7 @@ def load_checkpoint(
     scheduler: LambdaLR,
     scaler: GradScaler | None,
     device: torch.device,
+    ema: ModelEMA | None = None,
 ) -> tuple[int, int, float]:
     ckpt = torch.load(path, map_location=device)
     result = unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
@@ -468,6 +539,10 @@ def load_checkpoint(
     scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
+    if ema is not None and "ema" in ckpt:
+        ema.load_state_dict(ckpt["ema"])
+    elif ema is not None:
+        log.warning("Resume checkpoint has no EMA state; EMA shadow initialized from model weights.")
     log.info(
         f"Resumed from {path} "
         f"(epoch {ckpt['epoch']}, step {ckpt['global_step']}, "
@@ -580,6 +655,14 @@ def main() -> None:
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.lr)
 
+    # [v3.5] EMA of model weights. Updated once per optimizer step inside
+    # run_epoch; val runs a second forward pass with EMA weights swapped in.
+    # EMA typically damps single-epoch noise that was causing the selector to
+    # lock onto early checkpoints (v3.4 best ckpt at epoch 9/50).
+    ema: ModelEMA | None = None
+    if args.ema_decay > 0.0:
+        ema = ModelEMA(model, decay=args.ema_decay)
+
     scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
     # [v3.1] Conservative scaler: growth_interval=100000 exceeds total training
     # steps (14100), so scale stays at 2^13=8192 for the entire run.
@@ -605,6 +688,7 @@ def main() -> None:
     start_epoch       = 0
     global_step       = 0
     best_val_loss     = float("inf")
+    best_ema_val_loss = float("inf")
     nan_val_streak    = 0
     MAX_NAN_EPOCHS    = 3   # [v3.1] stop training after 3 consecutive NaN val epochs
     # [v3.3] Early stopping — model peaked at epoch 5/50 last run (severe overfitting)
@@ -613,7 +697,7 @@ def main() -> None:
 
     if args.resume:
         start_epoch, global_step, best_val_loss = load_checkpoint(
-            Path(args.resume), model, optimizer, scheduler, scaler, device
+            Path(args.resume), model, optimizer, scheduler, scaler, device, ema=ema,
         )
 
     writer = SummaryWriter(log_dir=args.log_dir) if is_main else None
@@ -638,6 +722,7 @@ def main() -> None:
             total_steps=total_steps, grad_clip=args.grad_clip,
             writer=writer, phase="train", use_amp=use_amp,
             world_size=world_size, is_main=is_main,
+            ema=ema,
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -656,6 +741,25 @@ def main() -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
+        # [v3.5] Second val pass with EMA weights swapped in. Cheap compared
+        # to training (val loader is ~20% of train), and gives a smoother
+        # selection signal than the raw weights at the current step.
+        ema_val_metrics: dict[str, float] | None = None
+        if ema is not None:
+            with ema.apply_to(model):
+                ema_val_metrics, _ = run_epoch(
+                    model=model, loader=loaders["val"],
+                    criterion=criterion, optimizer=None,
+                    scheduler=None, scaler=None,
+                    device=device, global_step=global_step,
+                    total_steps=total_steps, grad_clip=args.grad_clip,
+                    writer=None, phase="val", use_amp=use_amp,
+                    world_size=world_size, is_main=is_main,
+                )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+
         val_loss = val_metrics["total"]
 
         if is_main:
@@ -669,6 +773,12 @@ def main() -> None:
                 writer.add_scalar("train_epoch/routing_entropy", train_metrics.get("routing_entropy", 0.0), epoch)
                 writer.add_scalar("train_epoch/gap_rmse",        train_metrics.get("gap_rmse", 0.0),        epoch)
                 writer.add_scalar("val/gap_rmse",                val_metrics.get("gap_rmse", 0.0),          epoch)
+                if ema_val_metrics is not None:
+                    writer.add_scalar("val_ema/loss",     ema_val_metrics["total"],    epoch)
+                    writer.add_scalar("val_ema/recon",    ema_val_metrics["recon"],    epoch)
+                    writer.add_scalar("val_ema/forecast", ema_val_metrics["forecast"], epoch)
+                    writer.add_scalar("val_ema/eri",      ema_val_metrics["eri"],      epoch)
+                    writer.add_scalar("val_ema/gap_rmse", ema_val_metrics.get("gap_rmse", 0.0), epoch)
 
             vram_str = ""
             if device.type == "cuda":
@@ -676,6 +786,10 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats(device)
                 vram_str = f"  VRAM {vram_gb:.1f}GB"
 
+            ema_str = (
+                f" | ema {ema_val_metrics['total']:.4f} gap {ema_val_metrics.get('gap_rmse', float('nan')):.4f}"
+                if ema_val_metrics is not None else ""
+            )
             log.info(
                 f"Epoch {epoch:03d} | "
                 f"train {train_metrics['total']:.4f} "
@@ -683,7 +797,8 @@ def main() -> None:
                 f"F {train_metrics['forecast']:.4f} "
                 f"E {train_metrics['eri']:.4f} "
                 f"B {train_metrics.get('bloom_fcast', 0.0):.4f}) | "
-                f"val {val_loss:.4f} gap_rmse {val_metrics.get('gap_rmse', float('nan')):.4f} "
+                f"val {val_loss:.4f} gap_rmse {val_metrics.get('gap_rmse', float('nan')):.4f}"
+                f"{ema_str} "
                 f"skipped {int(train_metrics.get('skipped_batches', 0.0))} | "
                 f"{train_metrics['epoch_time_s']:.0f}s{vram_str}"
             )
@@ -698,32 +813,54 @@ def main() -> None:
                     )
             else:
                 nan_val_streak = 0
-                if val_loss < best_val_loss:
+                raw_improved = val_loss < best_val_loss
+                ema_improved = (
+                    ema_val_metrics is not None
+                    and math.isfinite(ema_val_metrics["total"])
+                    and ema_val_metrics["total"] < best_ema_val_loss
+                )
+
+                if raw_improved:
                     best_val_loss = val_loss
-                    no_improve_count = 0  # [v3.3] reset patience
                     save_checkpoint(
                         ckpt_dir / "best.pt", model, optimizer,
                         scheduler, scaler, epoch, global_step, best_val_loss,
                     )
                     log.info(f"  -> New best val loss: {best_val_loss:.4f}")
+
+                if ema_improved:
+                    best_ema_val_loss = ema_val_metrics["total"]
+                    # [v3.5] Save with EMA weights swapped in — the checkpoint
+                    # file contains the EMA shadow as the model state_dict.
+                    with ema.apply_to(model):
+                        save_checkpoint(
+                            ckpt_dir / "best_ema.pt", model, optimizer,
+                            scheduler, scaler, epoch, global_step, best_ema_val_loss,
+                        )
+                    log.info(f"  -> New best EMA val loss: {best_ema_val_loss:.4f}")
+
+                # [v3.5] Early stopping resets if EITHER the raw or EMA val
+                # improves. This prevents stopping while EMA is still winning.
+                if raw_improved or ema_improved:
+                    no_improve_count = 0
                 else:
-                    no_improve_count += 1  # [v3.3]
+                    no_improve_count += 1
                     if no_improve_count >= EARLY_STOP_PATIENCE:
                         log.info(
                             f"  Early stopping: no improvement for {EARLY_STOP_PATIENCE} epochs. "
-                            f"Best: {best_val_loss:.4f}"
+                            f"Best raw: {best_val_loss:.4f}  Best EMA: {best_ema_val_loss:.4f}"
                         )
 
             if math.isfinite(val_loss):
                 save_checkpoint(
                     ckpt_dir / "last.pt", model, optimizer,
-                    scheduler, scaler, epoch, global_step, val_loss,
+                    scheduler, scaler, epoch, global_step, val_loss, ema=ema,
                 )
 
             if math.isfinite(val_loss) and (epoch + 1) % args.save_every == 0:
                 save_checkpoint(
                     ckpt_dir / f"epoch_{epoch:03d}.pt", model, optimizer,
-                    scheduler, scaler, epoch, global_step, val_loss,
+                    scheduler, scaler, epoch, global_step, val_loss, ema=ema,
                 )
 
         # [v3.1] Broadcast early-stop decision to all ranks
@@ -752,6 +889,11 @@ def main() -> None:
     if is_main:
         log.info(f"Training complete. Best val loss: {best_val_loss:.4f}")
         log.info(f"Best checkpoint: {ckpt_dir / 'best.pt'}")
+        if ema is not None:
+            log.info(
+                f"Best EMA val loss: {best_ema_val_loss:.4f}  "
+                f"checkpoint: {ckpt_dir / 'best_ema.pt'}"
+            )
 
 
 if __name__ == "__main__":
