@@ -1,5 +1,5 @@
 """
-architecture_diagram.py — Generate MM-MARAS v3.4 architecture diagram
+architecture_diagram.py — Generate MM-MARAS v3.5 architecture diagram
 
 Usage:
     python scripts/architecture_diagram.py
@@ -83,13 +83,13 @@ def create_diagram(save_path: str = "figures/architecture.png"):
 
     # ── Title ────────────────────────────────────────────────────────
     ax.text(
-        8, 23.5, "MM-MARAS v3.4 Architecture",
+        8, 23.5, "MM-MARAS v3.5 Architecture",
         ha="center", va="center", fontsize=18, fontweight="bold",
         color=C_TEXT,
     )
     ax.text(
         8, 23.05,
-        "Multi-Modal Marine Remote-sensing Analysis & Synthesis System  |  ~44.4M params",
+        "Multi-Modal Mask-Aware Regime-Adaptive Spatiotemporal Model  |  ~46.4M params",
         ha="center", va="center", fontsize=9, color=C_SHAPE,
     )
 
@@ -123,11 +123,11 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     enc_h = 1.1
 
     encoders = [
-        ("Swin-UNet\nOpticalEncoder", "D=256"),
-        ("Swin-UNet\nPhysicsEncoder", "D=256"),
+        ("Swin-UNet + FiLM\nOpticalEncoder", "D=256"),
+        ("Swin-UNet + FiLM\nPhysicsEncoder", "D=256"),
         ("MaskNet\n(Embed+GNN+Mixer)", "D=256"),
-        ("Swin-UNet\nBGCAuxEncoder", "D=256"),
-        ("Swin-UNet\nDischargeEncoder", "D=256"),
+        ("Swin-UNet + FiLM\nBGCAuxEncoder", "D=256"),
+        ("Swin-UNet + FiLM\nDischargeEncoder", "D=256"),
     ]
 
     enc_centers = []
@@ -150,9 +150,9 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     fus_x = start_x
 
     _box(ax, fus_x, fus_y, fus_w, fus_h,
-         "Perceiver IO Cross-Modal Fusion",
-         "64 learned latents  |  Cross-Attn (5 streams) + Self-Attn + Decode  |  FP32 attention",
-         C_FUSION, fontsize=11, sublabel_size=8)
+         "Perceiver IO Cross-Modal Fusion  (mask-aware attention bias)",
+         "64 learned latents  |  Cross-Attn (5 streams) + Self-Attn + Decode  |  FP32 attention  |  obs/MCAR/MNAR masks → logit bias",
+         C_FUSION, fontsize=11, sublabel_size=7.5)
 
     fus_cx = fus_x + fus_w / 2
 
@@ -204,7 +204,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     moe_x = start_x
 
     _box(ax, moe_x, moe_y, moe_w, moe_h,
-         "Mixture-of-Experts Decoder (Soft Routing)",
+         "Mixture-of-Experts Decoder  (Per-Pixel Spatial Routing)",
          "",
          C_DECODER, fontsize=11, sublabel_size=8)
 
@@ -224,7 +224,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
             "Router", ha="center", va="center", fontsize=9,
             fontweight="bold", color="white", zorder=5)
     ax.text(router_x + router_w / 2, router_y + router_h * 0.30,
-            "GAP → Linear → Softmax\n→ (B, 4) weights", ha="center", va="center",
+            "1×1 Conv → Softmax\n→ (B, 4, H, W) per-pixel", ha="center", va="center",
             fontsize=7, color="white", alpha=0.9, zorder=5)
 
     # 4 Expert blocks
@@ -247,7 +247,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
                 ha="center", va="center", fontsize=8,
                 fontweight="bold", color="white", zorder=5)
         ax.text(ex + exp_w / 2, ey + eh * 0.30,
-                "Conv3x3 → GN\n→ GELU → Conv3x3",
+                "Conv3×3 → GN → GELU\n→ Drop2d(0.1) → Conv3×3",
                 ha="center", va="center", fontsize=6.5,
                 color="white", alpha=0.9, zorder=5)
 
@@ -255,7 +255,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     _arrow(ax, attn_x + attn_w / 2, temp_y,
            moe_x + moe_w / 2, moe_y + moe_h)
 
-    _shape_label(ax, 8, 10.9, "decoded: (B, 256, 64, 64)  |  routing_weights: (B, 4)")
+    _shape_label(ax, 8, 10.9, "decoded: (B, 256, 64, 64)  |  routing_weights: (B, 4, 64, 64) per-pixel")
 
     # ==================================================================
     # ROW 6: Output Heads  (y = 8.2 .. 9.6)
@@ -264,11 +264,11 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     head_h = 1.6
 
     heads = [
-        ("ReconHead", "Mask-aware\ndilated convs\n+ optical skip", "(B,1,H,W)\nChl-a recon"),
-        ("UncertaintyHead", "1x1 Conv\nlog-var clamp\n[-3, 10]", "(B,1,H,W)\nlog-variance"),
+        ("ReconHead", "Heteroscedastic\ndilated convs\n(mean + log-var)", "(B,1,H,W)\nChl-a recon"),
+        ("UncertaintyHead", "1×1 Conv\nlog-var clamp\n[-3, 10]", "(B,1,H,W)\nlog-variance"),
         ("ForecastHead", "Parallel trunk\n+ ConvGRU\nrefinement", "(B,5,H,W)\n5-step forecast"),
-        ("ERIHead", "Conv3x3 → GN\n→ GELU → Drop\n→ Conv1x1", "(B,5,H,W)\n5-class ERI"),
-        ("BloomFcastHead", "Conv trunk\n+ per-step\n1x1 heads", "(B,5,H,W)\nbloom logits"),
+        ("ERIHead", "Conv3×3 → GN\n→ GELU → Drop\n→ Conv1×1", "(B,5,H,W)\n5-class ERI"),
+        ("BloomFcastHead", "Conv trunk\n+ per-step\n1×1 heads", "(B,5,H,W)\nbloom logits"),
     ]
 
     head_centers = []
@@ -292,7 +292,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
         ("Recon Loss", "Heteroscedastic\nNLL"),
         ("Holdout Loss", "NLL + Laplacian\n+ L1 bias"),
         ("Forecast Loss", "Huber + SSIM"),
-        ("ERI Loss", "Focal ordinal\nCross-Entropy"),
+        ("ERI Loss", "Ordinal Focal CE\n(γ=2, w₁=5.0)"),
         ("Bloom Loss", "Binary CE\n(pos_weight=10)"),
     ]
 
@@ -306,7 +306,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
     ax.text(
         8, 5.7,
         "Total = w_recon * L_recon + scale * (w_fcast * L_fcast + w_eri * L_eri + w_bloom * L_bloom) "
-        "+ w_holdout * sqrt(scale) * L_holdout + w_aux * L_aux",
+        "+ w_holdout * sqrt(scale) * L_holdout + w_aux * L_aux  (w_aux=0.05, per-pixel Switch)",
         ha="center", va="center", fontsize=7.5, color=C_TEXT,
         fontstyle="italic", zorder=5,
     )
@@ -314,7 +314,7 @@ def create_diagram(save_path: str = "figures/architecture.png"):
         8, 5.35,
         "Curriculum: scale ramps 0 → 1.0 over 60% of training  |  "
         "AdamW (lr=5e-5, wd=2e-2)  |  Cosine LR + 5-epoch warmup  |  "
-        "AMP (FP16, frozen scaler=8192)",
+        "AMP (FP16, frozen scaler=8192)  |  EMA (decay 0.999)  |  Eval: 8-way TTA + per-horizon bloom thresholds",
         ha="center", va="center", fontsize=7, color=C_SHAPE, zorder=5,
     )
 
