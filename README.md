@@ -4,77 +4,80 @@
 
 MM-MARAS is a deep learning system for Bay of Bengal chlorophyll-a (Chl-a) reconstruction, 5-step forecasting, pixel-level uncertainty estimation, algal bloom early warning, and ecosystem risk assessment. It fuses five heterogeneous input streams through a Perceiver IO cross-attention module, processes the temporal sequence with a two-layer ConvLSTM, and decodes through a soft-routing Mixture-of-Experts decoder.
 
-The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~44.4M parameters) that consumes those patches.
+The project has two parts: a preprocessing pipeline that downloads, aligns, normalizes, and patches multi-source oceanographic data, and a PyTorch model (~46.4M parameters) that consumes those patches.
 
-## Results (v3.4 — current)
+## Results (v3.5 — current)
 
-Trained on 1,264 patches from the Bay of Bengal (2021-2024), evaluated on 260 test patches (2024-2025). Training: 2x T4 GPUs with DDP + AMP, batch size 4 per GPU, 50 epochs at lr=5e-5 (best checkpoint at epoch 9, val loss -1.2939). Early stopping with patience 12. Peak VRAM: ~7.7 GB per T4 GPU. Bloom threshold calibrated at 0.85.
+Trained on 1,264 patches from the Bay of Bengal (2021-2024), evaluated on 260 test patches (2024-2025). Training: 2x T4 GPUs with DDP + AMP, batch size 4 per GPU, 60 epochs at lr=5e-5 (best EMA checkpoint at epoch 47, val loss -1.3790, 0 AMP scaler skips after warmup). EMA decay 0.999. Peak VRAM: ~8.1 GB per T4 GPU. Wall time: ~10.4 h. Evaluation uses 8-way TTA (4 rotations × H-flip), per-horizon bloom thresholds (0.90 across all 5 horizons), and gap-bias correction (+0.1989).
 
 ### Reconstruction
 
 | Subset | Pixels | RMSE | MAE | Bias | R² | SSIM |
 |---|---|---|---|---|---|---|
-| All ocean | 1,031,940 | 0.3727 | 0.1783 | -0.0564 | 0.219 | 0.409 |
-| Valid (observed) | 848,900 | 0.1373 | 0.0572 | +0.0387 | 0.912 | 0.418 |
-| Gap (missing) | 183,040 | 0.8342 | 0.7399 | -0.4974 | -- | 0.000 |
+| All ocean | 1,031,940 | 0.1847 | 0.0782 | -0.0130 | 0.808 | 0.847 |
+| Valid (observed) | 848,900 | 0.0815 | 0.0308 | +0.0136 | 0.969 | 0.832 |
+| Gap (missing) | 183,040 | 0.4020 | 0.2983 | -0.1361 | -- | 0.000 |
 
-CRPS: 0.0725.
+CRPS: 0.0603.
 
 ### Forecast
 
 | Horizon | RMSE | MAE | SSIM |
 |---|---|---|---|
-| +1 day | 0.1963 | 0.0896 | 0.710 |
-| +2 days | 0.2038 | 0.0940 | 0.687 |
-| +3 days | 0.2093 | 0.0938 | 0.637 |
-| +4 days | 0.2153 | 0.0963 | 0.622 |
-| +5 days | 0.2193 | 0.0979 | 0.617 |
+| +1 day | 0.1025 | 0.0382 | 0.940 |
+| +2 days | 0.1311 | 0.0483 | 0.877 |
+| +3 days | 0.1556 | 0.0576 | 0.831 |
+| +4 days | 0.1721 | 0.0649 | 0.791 |
+| +5 days | 0.1838 | 0.0709 | 0.758 |
 
 ### ERI classification
 
-Accuracy: 0.9978. Macro F1: 0.521. Ordinal MAE: 0.003. Per-class F1: class 0 = 0.999, class 1 = 0.312, class 2 = 0.000, class 3 = 0.394, class 4 = 0.902.
+Accuracy: 0.9994. Macro F1: 0.926. Ordinal MAE: 0.001. Per-class F1: class 0 = 1.000, class 1 = 0.634, class 2 = 1.000, class 3 = 0.998, class 4 = 0.999.
 
 ### Bloom lead-time prediction
 
 | Horizon | Precision | Recall | F1 |
 |---|---|---|---|
-| +1 day | 0.755 | 0.773 | 0.764 |
-| +2 days | 0.727 | 0.789 | 0.757 |
-| +3 days | 0.744 | 0.751 | 0.748 |
-| +4 days | 0.749 | 0.734 | 0.741 |
-| +5 days | 0.739 | 0.730 | 0.734 |
+| +1 day | 0.841 | 0.886 | 0.863 |
+| +2 days | 0.816 | 0.864 | 0.840 |
+| +3 days | 0.798 | 0.843 | 0.820 |
+| +4 days | 0.784 | 0.825 | 0.804 |
+| +5 days | 0.776 | 0.811 | 0.793 |
 
-Macro F1: 0.749. Bloom rate: ~1.18% of ocean pixels.
+Macro F1: 0.824. Bloom rate: ~1.18% of ocean pixels. Per-horizon thresholds calibrated at 0.90 (vs default 0.5 which gives Macro F1 0.741).
 
 ### Uncertainty calibration
 
-ECE: 0.0416. Variance-error correlation: 0.527.
+ECE: 0.0447. Variance-error correlation: 0.488.
 
 ### MoE routing
 
-Expert utilization: 0.9995. Routing entropy: 1.386 / 1.386 (near-maximum). Expert weights: 25.9%, 23.5%, 25.5%, 25.1%.
+Expert utilization: 1.0000. Routing entropy: 1.386 / 1.386 (maximum). Expert weights: 25.00%, 25.02%, 24.97%, 25.01%. Per-pixel spatial routing distributes load uniformly across the 4 experts.
 
 ### Ecosystem impact
 
-Mean: 0.241. P90: 0.597. P95: 0.760. High-impact fraction (score > 0.6): 9.89% of ocean pixels.
+Mean: 0.178. P90: 0.298. P95: 0.403. High-impact fraction (score > 0.6): 2.64% of ocean pixels.
 
 ### Version history
 
 <details>
-<summary>v2 → v3.4 metric progression</summary>
+<summary>v2 → v3.5 metric progression</summary>
 
-| Metric | v2 | v3.2 | v3.4 |
-|---|---|---|---|
-| Valid RMSE | 0.102 | **0.127** | 0.137 |
-| Valid R² | 0.952 | 0.925 | 0.912 |
-| Forecast +1 RMSE | 0.132 | 0.249 | **0.196** |
-| Forecast +1 SSIM | 0.889 | 0.488 | **0.710** |
-| Bloom Macro F1 | -- | 0.620 | **0.749** |
-| ERI Macro F1 | 0.687 | 0.335 | **0.521** |
-| CRPS | 0.023 | 0.079 | **0.073** |
-| MoE utilisation | 1.000 | -- | **0.9995** |
+| Metric | v2 | v3.2 | v3.4 | v3.5 |
+|---|---|---|---|---|
+| Valid RMSE | 0.102 | 0.127 | 0.137 | **0.082** |
+| Valid R² | 0.952 | 0.925 | 0.912 | **0.969** |
+| Valid SSIM | -- | -- | 0.418 | **0.832** |
+| Gap RMSE | -- | -- | 0.834 | **0.402** |
+| Forecast +1 RMSE | 0.132 | 0.249 | 0.196 | **0.103** |
+| Forecast +1 SSIM | 0.889 | 0.488 | 0.710 | **0.940** |
+| Forecast +5 RMSE | -- | -- | 0.219 | **0.184** |
+| Bloom Macro F1 | -- | 0.620 | 0.749 | **0.824** |
+| ERI Macro F1 | 0.687 | 0.335 | 0.521 | **0.926** |
+| CRPS | 0.023 | 0.079 | 0.073 | **0.060** |
+| Params | ~42M | ~43M | ~44.4M | **~46.4M** |
 
-v3.2 introduced FP16 stability fixes (FP32 attention, activation clamps, GradScaler frozen at 8192). v3.3 added dropout + anti-overfitting changes (too aggressive — bloom F1 collapsed to 0.000). v3.4 dialed back to the optimal balance: kept dropout, reduced weight decay and curriculum speed.
+v3.2 introduced FP16 stability fixes (FP32 attention, activation clamps, GradScaler frozen at 8192). v3.3 added dropout + anti-overfitting changes (too aggressive — bloom F1 collapsed to 0.000). v3.4 dialed back to the optimal balance. v3.5 added FiLM regime-adaptive normalization, mask-aware attention bias, heteroscedastic recon head, ordinal focal CE for ERI, per-pixel spatial MoE routing with Switch aux loss, EMA weight tracking, 8-way TTA, MC-dropout epistemic uncertainty, and per-horizon bloom thresholds.
 
 </details>
 
@@ -96,7 +99,7 @@ Additionally, `compute_ecosystem_impact()` derives a per-pixel 0-1 ecosystem imp
 
 ## Architecture
 
-![MM-MARAS v3.4 Architecture](figures/architecture.png)
+![MM-MARAS v3.5 Architecture](figures/architecture.png)
 
 ```
 optical (chl_obs + obs_mask)      --> OpticalEncoder   (Swin-UNet, 2ch)  --\                                          skip to ReconHead
@@ -106,15 +109,15 @@ bgc_aux                          --> BGCAuxEncoder     (Swin-UNet, 5ch)  --/   (
 discharge                        --> DischargeEncoder  (Swin-UNet, 2ch)  --/
 ```
 
-**Encoders.** All four spatial encoders reuse the same Swin-UNet backbone (patch embed, 3-stage encoder, bottleneck, 3-stage decoder with skip connections) with independent weights. Gradient checkpointing wraps each encoder's forward pass to trade compute for ~40% activation memory savings. Stage dimensions: 64, 128, 256; window sizes: 8, 8, 4. The physics encoder concatenates ocean state (6ch), wind/atmosphere (4ch), and static context (2ch, broadcast over time) into 12 channels. MaskNet classifies pixels into five missingness types via learned embeddings, propagates context through two rounds of masked grid-graph convolution, and mixes across time with depthwise temporal convolution.
+**Encoders.** All four spatial encoders reuse the same Swin-UNet backbone (patch embed, 3-stage encoder, bottleneck, 3-stage decoder with skip connections) with independent weights. Gradient checkpointing wraps each encoder's forward pass to trade compute for ~40% activation memory savings. Stage dimensions: 64, 128, 256; window sizes: 8, 8, 4. The physics encoder concatenates ocean state (6ch), wind/atmosphere (4ch), and static context (2ch, broadcast over time) into 12 channels. FiLM regime-adaptive normalization (v3.5) conditions the encoder stem on wind/discharge/temporal physics covariates, so the model can specialize on seasonal regimes without splitting experts. MaskNet classifies pixels into five missingness types via learned embeddings, propagates context through two rounds of masked grid-graph convolution, and mixes across time with depthwise temporal convolution.
 
-**Fusion.** Perceiver IO with 64 latent queries cross-attending to spatially pooled tokens from all five streams (1280 KV tokens). Cross-attention uses FP32 for numerical stability under AMP. Self-attention refinement, then decode back to full resolution via position-aware spatial queries with residual blend. Activation clamping (±50) after each residual addition prevents overflow.
+**Fusion.** Perceiver IO with 64 latent queries cross-attending to spatially pooled tokens from all five streams (1280 KV tokens). Cross-attention uses FP32 for numerical stability under AMP and mask-aware attention bias (v3.5) pipes observation/MCAR/MNAR masks into attention logits as additive bias, preventing cloud-masked pixels from corrupting spatial attention. Self-attention refinement, then decode back to full resolution via position-aware spatial queries with residual blend. Activation clamping (±50) after each residual addition prevents overflow.
 
 **Temporal.** Two stacked ConvLSTM layers. Layer 1 returns the full hidden sequence (B, T, D, H, W); layer 2 processes it with GroupNorm-normalized global-context bias to produce the final state (B, D, H, W). Cell states clamped to ±5.0 to prevent FP16 overflow. The final state is enriched via TemporalReconAttention: 4-head cross-attention from the last-timestep query to the full layer-1 sequence, using cosine similarity with learnable temperature, L2-normalized Q/K, and obs_mask-weighted spatial pooling. Gap pixels at the last timestep attend to previously observed timesteps to recover context lost during temporal encoding.
 
-**Decoder.** Four expert ConvNets (Conv3×3 → GroupNorm → GELU → Dropout2d(0.1) → Conv3×3) soft-blended per sample via global routing (average pool, MLP, softmax). Load-balancing auxiliary loss at weight 0.01.
+**Decoder.** Four expert ConvNets (Conv3×3 → GroupNorm → GELU → Dropout2d(0.1) → Conv3×3) soft-blended **per pixel** (v3.5) via spatial routing (1×1 conv → softmax over 4 experts, applied at every spatial location). Switch Transformer load-balancing auxiliary loss at weight 0.05. Per-pixel routing replaces the v3.4 per-sample global routing, letting different regions of a single patch attend to different experts.
 
-**Heads.** All heads use Dropout2d(0.2) for regularization. Reconstruction: mask-conditioned spatial head — fuses decoded features, optical encoder skip connection, and obs_mask (D×2+1 channels), then 4 dilated convolutions (dilation 1, 2, 4, 8; 25×25 effective receptive field), then 1×1 projection. Forecast: two-stage — (1) parallel prediction via shared 2-layer trunk + per-step projections, then (2) autoregressive ConvGRU refinement unrolled over 5 steps (D//4 channels, corrections clamped to [-1, 1]). Uncertainty: 1×1 conv, output clamped to [-3, 10]. ERI: predicts from decoded features only (no label leakage); Conv2d(D → D//2 → 5) with GroupNorm + Dropout2d. Bloom forecast: shared trunk + per-step binary outputs. Total: ~44.4M parameters.
+**Heads.** All heads use Dropout2d(0.2) for regularization. Reconstruction: mask-conditioned spatial head — fuses decoded features, optical encoder skip connection, and obs_mask (D×2+1 channels), then 4 dilated convolutions (dilation 1, 2, 4, 8; 25×25 effective receptive field), then 1×1 projection to **mean + log-variance** (heteroscedastic, v3.5) trained with proper NLL recon loss. Forecast: two-stage — (1) parallel prediction via shared 2-layer trunk + per-step projections, then (2) autoregressive ConvGRU refinement unrolled over 5 steps (D//4 channels, corrections clamped to [-1, 1]). Uncertainty: 1×1 conv, output clamped to [-3, 10]. ERI: predicts from decoded features only (no label leakage); Conv2d(D → D//2 → 5) with GroupNorm + Dropout2d, trained with ordinal focal CE (v3.5) for the 0.03%–99.85% class skew. Bloom forecast: shared trunk + per-step binary outputs. Total: ~46.4M parameters.
 
 **Architectural evolution.** Key changes from v2:
 - [A] ReconHead: dilated convolutions conditioned on `obs_mask` with optical encoder skip connection (was 1×1 conv)
@@ -123,6 +126,12 @@ discharge                        --> DischargeEncoder  (Swin-UNet, 2ch)  --/
 - [D] ERI head predicts from learned features only (v3.1 removed bloom_count input that caused label leakage)
 - [E] FP16 stability: FP32 attention matmul, activation clamping, frozen GradScaler at 8192 (v3.2)
 - [F] Regularization: Dropout2d(0.2) in all heads, Dropout2d(0.1) in MoE experts (v3.3/v3.4)
+- [G] FiLM regime-adaptive normalization in encoder stem (v3.5)
+- [H] Mask-aware attention bias in Perceiver fusion (v3.5)
+- [I] Heteroscedastic recon head with predicted variance, trained with NLL (v3.5)
+- [J] Ordinal focal CE for ERI classification (v3.5)
+- [K] Per-pixel spatial MoE routing with Switch aux loss (v3.5)
+- [L] EMA weight tracking (decay 0.999), 8-way TTA, MC-dropout epistemic uncertainty, per-horizon bloom thresholds (v3.5)
 
 ## Repository layout
 
@@ -165,7 +174,7 @@ sea-you-again/
 │   ├── eval.py               Test-set evaluation, bloom forecast metrics, ecosystem impact
 │   └── architecture_diagram.py  Generate model architecture diagram
 └── figures/
-    └── architecture.png      MM-MARAS v3.4 architecture diagram
+    └── architecture.png      MM-MARAS v3.5 architecture diagram
 ```
 
 ---
@@ -245,9 +254,9 @@ Six loss terms with curriculum scheduling (secondary losses ramped from 0 → 1.
 | Reconstruction | 1.0 | Heteroscedastic NLL on observed ocean pixels (log_var floor -3) |
 | Holdout recon | 0.8 | NLL + Laplacian gradient matching + L1 bias on held-out pixels |
 | Forecast | 0.5 | Masked Huber (delta=0.5) + SSIM (weight 0.2) over forecast window |
-| ERI | 0.3 | Focal ordinal cross-entropy (gamma=2.0, class 1 weight 8.0) |
+| ERI | 0.3 | Ordinal focal cross-entropy (gamma=2.0, class 1 weight 5.0) |
 | Bloom forecast | 0.3 | Binary CE with pos_weight=10 per forecast step |
-| MoE auxiliary | 0.01 | Load-balancing (Switch Transformer) |
+| MoE auxiliary | 0.05 | Load-balancing (Switch Transformer, per-pixel) |
 
 ### Data augmentation
 
@@ -255,41 +264,49 @@ Random flips (horizontal p=0.5, vertical p=0.5) and 90° rotations (p=0.5) appli
 
 ### Training
 
-**v3.4 (current):**
+**v3.5 (current):**
 
 ```bash
-torchrun --nproc_per_node=2 scripts/Train.py \
+torchrun --nproc_per_node=2 --standalone scripts/Train.py \
     --patch-dir data-preprocessing-pipeline/data/patches \
-    --batch-size 4 --epochs 50 --warmup-epochs 5 \
-    --bloom-oversample 3
+    --ckpt-dir checkpoints \
+    --batch-size 4 --epochs 60 --warmup-epochs 5 \
+    --lr 5e-5 --weight-decay 2e-2 \
+    --ema-decay 0.999 --w-aux 0.05 --bloom-oversample 3
 ```
 
-Single-phase training: lr=5e-5, weight_decay=2e-2, cosine LR with 5-epoch linear warmup. Early stopping with patience 12. GradScaler frozen at init_scale=8192 (growth_interval=100,000 exceeds total steps). Best checkpoint typically at epoch 9-15. Peak VRAM: ~7.7 GB per T4 GPU with AMP and gradient checkpointing. ~500 seconds per epoch on 2×T4.
+Single-phase training: lr=5e-5, weight_decay=2e-2, cosine LR with 5-epoch linear warmup. EMA of model weights (decay 0.999) tracked in parallel; `best_ema.pt` is the canonical evaluation checkpoint. GradScaler frozen at init_scale=8192 (growth_interval=100,000 exceeds total steps). Best EMA checkpoint typically at epoch 40-50 (val plateaus ~epoch 40 — 45 epochs is enough if you want to save wall time). Peak VRAM: ~8.1 GB per T4 GPU with AMP and gradient checkpointing. ~540 seconds per epoch on 2×T4; ~10.4 h total for 60 epochs.
 
-### Post-hoc calibration
+### Post-hoc calibration and evaluation
 
-Run calibration first (on val set), then evaluation (on test set):
+Run calibration first (on val set), then evaluation (on test set) with the calibrated values:
 
 ```bash
-# Step 1: Calibrate — finds gap bias and optimal bloom threshold
+# Step 1: Calibrate — finds gap bias and per-horizon bloom thresholds
 python model/calibrate.py \
-    --ckpt checkpoints/best.pt \
+    --ckpt checkpoints/best_ema.pt \
     --patch-dir data-preprocessing-pipeline/data/patches \
     --out-dir calibration_results
 
-# Step 2: Evaluate — pass calibrated gap bias from step 1
+# Step 2: Evaluate — pass calibrated values from step 1, enable TTA
 python scripts/eval.py \
-    --ckpt checkpoints/best.pt \
+    --ckpt checkpoints/best_ema.pt \
     --patch-dir data-preprocessing-pipeline/data/patches \
     --out-dir eval_results \
-    --gap-bias <VALUE_FROM_CALIBRATE>
+    --gap-bias <VALUE_FROM_CALIBRATE> \
+    --bloom-thresholds <t1> <t2> <t3> <t4> <t5> \
+    --tta
 ```
 
 **Gap bias correction**: The model systematically over-predicts on gap (cloud-masked) pixels. `calibrate.py` measures the mean bias on the validation set; `eval.py --gap-bias` subtracts it from gap predictions at inference. The bias varies per model version — always re-calibrate after retraining.
 
-**Bloom threshold**: The default sigmoid threshold (0.5) is replaced with a calibrated threshold of 0.85 (hardcoded in eval.py), found by sweeping thresholds to maximize F1 on the validation set.
+**Per-horizon bloom thresholds** (v3.5): `calibrate.py` sweeps both pooled and per-horizon thresholds (0.10–0.95 step 0.05) and returns the 5 values that maximize F1 per forecast step. The v3.5 run converged to 0.90 across all horizons, raising Macro F1 from 0.741 (default 0.5) to 0.824. Pass them to `eval.py` as `--bloom-thresholds t1 t2 t3 t4 t5`.
 
-Outputs: `metrics.json`, `confusion_matrix.csv`, `calibration.csv`, and `figures/` containing reconstruction panels, forecast panels, bloom probability + ecosystem impact maps, calibration diagram, and routing bar chart.
+**Test-time augmentation** (v3.5): `eval.py --tta` runs 8 augmentations (4 rotations × H-flip), inverts the spatial outputs, and averages in native space. ~8× eval latency but removes horizon-to-horizon SSIM wobble and improves all accuracy metrics.
+
+**MC-dropout epistemic uncertainty** (v3.5, optional): `eval.py --mc-dropout N` runs N stochastic forward passes with dropout layers enabled at eval time, reporting `recon_std` and `forecast_std` as epistemic uncertainty alongside the aleatoric variance head.
+
+Outputs: `metrics.json` (includes `tta`, `mc_dropout`, `bloom_thresholds`, `gap_bias`, `mc_dropout_epistemic` fields), `confusion_matrix.csv`, `calibration.csv`, and `figures/` containing reconstruction panels, forecast panels, bloom probability + ecosystem impact maps, calibration diagram, and routing bar chart.
 
 ### Smoke tests
 
@@ -349,7 +366,9 @@ A single inference pass produces: bloom probability timeline (5 maps, one per fu
 - The optical encoder supports optional SatMAE weight initialization via `load_satmae_patch_embed()`.
 - The contrastive pre-alignment loss in `fusion.py` is available for an optional pretraining phase.
 - All pipeline downloads are resumable. Normalization statistics are training-split-only.
-- Checkpoint compatibility: v2 ≠ v1 (new heads), v3 ≠ v2 (new ReconHead, ForecastHead, ERIHead, TemporalModuleV3), v3.2 ≠ v3.1 (seq_norm GroupNorm added). v3.3/v3.4 are weight-compatible with v3.2 (hyperparameter changes only).
+- Checkpoint compatibility: v2 ≠ v1 (new heads), v3 ≠ v2 (new ReconHead, ForecastHead, ERIHead, TemporalModuleV3), v3.2 ≠ v3.1 (seq_norm GroupNorm added). v3.3/v3.4 are weight-compatible with v3.2 (hyperparameter changes only). **v3.5 ≠ v3.4**: FiLM layers in encoder stem, mask-aware attention bias in fusion, heteroscedastic recon head (mean + log-var), per-pixel spatial MoE router, and EMA tracking are new architectural parameters.
+- `best_ema.pt` (EMA weights) is the canonical v3.5 evaluation checkpoint, not `best.pt`. EMA typically tracks val loss 0.01–0.05 better than the raw weights.
+- MoE routing uniformity at Utilisation=1.0000 with per-pixel routing is expected — each pixel picks its preferred expert, and the uniform batch average comes from even spatial distribution. To verify experts are actually specialized (not collapsed), inspect per-pixel routing variance, not batch-mean weights.
 - Gap SSIM ≈ 0 is a metric limitation, not a model failure: gap pixels are scattered (cloud-masked) with no spatial structure for SSIM to measure. Gap RMSE and MAE are the meaningful gap quality metrics.
 - `eval.py --gap-bias` accepts a calibrated gap bias value. Always re-run `calibrate.py` after retraining.
 - cuFFT/cuDNN/cuBLAS registration warnings during Kaggle DDP training are harmless.
