@@ -1,5 +1,19 @@
 """
-loss.py — MM-MARAS loss functions (v3.5)
+loss.py — MM-MARAS loss functions (v3.6)
+
+Changes from v3.5:
+    [v3.6] ERI class weights now configurable via MARASSLoss(eri_class_weights=...)
+           and eri_loss(class_weights=...). Default bumped [0.1, 10, 12, 6, 6]
+           → [0.1, 12, 12, 6, 6] to push class-1 F1 (still 0.634 in v3.5 eval).
+           Train.py adds --eri-class1-weight to expose this knob without
+           changing the rest of the ratio.
+    [v3.6] MoE aux weight is now annealable: train.py linearly decays
+           LossWeights.aux from --w-aux to --w-aux-final between
+           --w-aux-anneal-start-epoch and --w-aux-anneal-end-epoch.
+           Default schedule 0.05 → 0.005 over epochs 5→30 lets the
+           per-pixel router finish its load-balancing job during
+           curriculum and then frees experts to specialise. v3.5 ended
+           with uniform 0.2500 routing weights — too much aux pressure.
 
 Changes from v3.4:
     [v3.5] curriculum_frac 0.60 → 0.30: best checkpoint was landing at
@@ -70,6 +84,7 @@ Default weights:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -293,10 +308,16 @@ def eri_loss(
     land_mask: Tensor,
     bloom_mask: Tensor | None = None,
     focal_gamma: float = 2.0,
+    class_weights: Sequence[float] | None = None,
 ) -> Tensor:
     """
     Ordinal cross-entropy for ERI classification (5 levels: 0-4).
     Focal modulation + soft ordinal penalty + rebalanced class weights.
+
+    Args:
+        class_weights: Optional 5-element per-class weight vector. Defaults
+            to v3.5 values [0.1, 10.0, 12.0, 6.0, 6.0]. v3.6 default in
+            MARASSLoss is [0.1, 12.0, 12.0, 6.0, 6.0] (class-1 bumped).
     """
     B, n_levels, H, W = logits.shape
     ocean = 1.0 - land_mask
@@ -319,10 +340,23 @@ def eri_loss(
         # [v3.5] Bumped to break class-2 collapse (F1 was 0.000 in v3.4).
         # Ratio preserves class 1 > 2 > 3,4 > 0 ordering but widens the gap
         # between background and each minority class.
-        class_weights = torch.tensor(
-            [0.1, 10.0, 12.0, 6.0, 6.0], device=logits.device, dtype=torch.float32
-        )
-        sample_weight = class_weights[target_long]
+        # [v3.6] Now configurable; default keeps v3.5 values when caller
+        # passes class_weights=None (back-compat for direct eri_loss callers).
+        if class_weights is None:
+            class_weights_tensor = torch.tensor(
+                [0.1, 10.0, 12.0, 6.0, 6.0],
+                device=logits.device, dtype=torch.float32,
+            )
+        else:
+            class_weights_tensor = torch.as_tensor(
+                list(class_weights), device=logits.device, dtype=torch.float32,
+            )
+            if class_weights_tensor.numel() != n_levels:
+                raise ValueError(
+                    f"class_weights must have {n_levels} entries, got "
+                    f"{class_weights_tensor.numel()}"
+                )
+        sample_weight = class_weights_tensor[target_long]
 
         level_idx  = torch.arange(n_levels, device=logits.device, dtype=torch.float32)
         level_idx  = level_idx.view(1, n_levels, 1, 1)
@@ -465,6 +499,9 @@ class LossWeights:
     bloom_fcast: float = 0.3    # [FEAT 1] bloom lead-time prediction
     aux:         float = 0.05   # [v3.5] 0.01→0.05: old weight was too small
                                 # to fight near-uniform routing (entropy≈log(4))
+                                # [v3.6] Train.py now anneals this 0.05→0.005
+                                # over epochs 5–30 so experts can specialise
+                                # after the early load-balancing job is done.
     holdout:     float = 0.8    # [v3] was 0.5 — stronger gap supervision
 
 
@@ -486,6 +523,7 @@ class MARASSLoss(nn.Module):
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
         bloom_threshold: float = 0.0,
+        eri_class_weights: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
         self.w = weights or LossWeights()
@@ -493,6 +531,19 @@ class MARASSLoss(nn.Module):
         self.forecast_delta   = forecast_delta
         self.eri_focal_gamma  = eri_focal_gamma
         self.bloom_threshold  = bloom_threshold
+        # [v3.6] Configurable per-class ERI weights. Default raises class-1
+        # weight 10.0 → 12.0 to push the still-weak v3.5 class-1 F1 (0.634).
+        # Train.py exposes --eri-class1-weight to override just the class-1
+        # entry without touching the rest of the ratio.
+        if eri_class_weights is None:
+            self.eri_class_weights: tuple[float, ...] = (0.1, 12.0, 12.0, 6.0, 6.0)
+        else:
+            ecw = tuple(float(w) for w in eri_class_weights)
+            if len(ecw) != 5:
+                raise ValueError(
+                    f"eri_class_weights must have 5 entries, got {len(ecw)}"
+                )
+            self.eri_class_weights = ecw
 
     def _curriculum_scale(self, step: int | None, total_steps: int | None) -> float:
         if step is None or total_steps is None:
@@ -549,11 +600,12 @@ class MARASSLoss(nn.Module):
         # --- ERI (focal + soft ordinal) ---
         eri_target = build_eri_target(bloom_mask)
         l_eri = eri_loss(
-            logits      = outputs["eri"],
-            target      = eri_target,
-            land_mask   = land_mask,
-            bloom_mask  = bloom_mask,
-            focal_gamma = self.eri_focal_gamma,
+            logits        = outputs["eri"],
+            target        = eri_target,
+            land_mask     = land_mask,
+            bloom_mask    = bloom_mask,
+            focal_gamma   = self.eri_focal_gamma,
+            class_weights = self.eri_class_weights,
         )
 
         # --- [FEAT 1] Bloom forecast (binary CE) ---

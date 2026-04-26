@@ -222,11 +222,27 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-forecast", type=float, default=0.5)
     p.add_argument("--w-eri",      type=float, default=0.3)
     p.add_argument("--w-aux",      type=float, default=0.05)  # [v3.5] 0.01→0.05: force expert specialization
+    # [v3.6] MoE aux annealing — push experts apart early, then back off so
+    # they can specialise. v3.5 ended at uniform 0.2500 routing weights;
+    # decaying w_aux after the load-balancing job is done is the cleanest fix.
+    p.add_argument("--w-aux-final", type=float, default=0.005,
+                   help="[v3.6] Anneal target for MoE aux weight (default 0.005). "
+                        "Set equal to --w-aux to disable annealing.")
+    p.add_argument("--w-aux-anneal-start-epoch", type=int, default=5,
+                   help="[v3.6] Epoch at which w_aux annealing starts (default 5, "
+                        "matches --warmup-epochs).")
+    p.add_argument("--w-aux-anneal-end-epoch", type=int, default=30,
+                   help="[v3.6] Epoch at which w_aux reaches --w-aux-final (default 30).")
     p.add_argument("--w-holdout",  type=float, default=0.8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None)
-    p.add_argument("--bloom-oversample", type=int, default=3,
-                   help="[v3] Duplicate bloom patches N× in training set (default 3)")
+    p.add_argument("--bloom-oversample", type=int, default=5,
+                   help="[v3] Duplicate bloom patches N× in training set "
+                        "(v3.5 default 3, [v3.6] 5 for stronger class-1 supervision).")
+    p.add_argument("--eri-class1-weight", type=float, default=12.0,
+                   help="[v3.6] ERI class-1 (low-bloom) weight in ordinal CE. "
+                        "v3.5 used 10.0; default 12.0 to push class-1 F1 (was 0.634). "
+                        "Other classes stay at [0.1, ?, 12, 6, 6].")
     p.add_argument("--device", default=None)
     return p.parse_args()
 
@@ -238,6 +254,36 @@ def build_scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int) -> La
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return LambdaLR(optimizer, lr_lambda)
+
+
+def w_aux_for_epoch(
+    epoch: int,
+    w_aux_start: float,
+    w_aux_final: float,
+    anneal_start_epoch: int,
+    anneal_end_epoch: int,
+) -> float:
+    """
+    [v3.6] Linearly anneal MoE aux loss weight from `w_aux_start` to
+    `w_aux_final` between `anneal_start_epoch` (inclusive) and
+    `anneal_end_epoch` (inclusive).
+
+    Held flat at `w_aux_start` before the start epoch, and at
+    `w_aux_final` from the end epoch onward. If the two endpoints are
+    equal (or the window is degenerate), annealing is a no-op.
+    """
+    if w_aux_start == w_aux_final:
+        return w_aux_start
+    if anneal_end_epoch <= anneal_start_epoch:
+        # Degenerate window — snap to final once past start.
+        return w_aux_final if epoch >= anneal_end_epoch else w_aux_start
+    if epoch <= anneal_start_epoch:
+        return w_aux_start
+    if epoch >= anneal_end_epoch:
+        return w_aux_final
+    span = anneal_end_epoch - anneal_start_epoch
+    progress = (epoch - anneal_start_epoch) / span
+    return w_aux_start + (w_aux_final - w_aux_start) * progress
 
 
 def routing_entropy(routing_weights: torch.Tensor) -> float:
@@ -673,6 +719,10 @@ def main() -> None:
         device="cuda", init_scale=2**13, growth_interval=100_000,
     ) if use_amp else None
 
+    # [v3.6] ERI class-1 weight bumped via CLI (default 12.0). Other entries
+    # follow the v3.5 ratio [0.1, _, 12, 6, 6]; we just splice in arg value.
+    eri_class_weights = (0.1, float(args.eri_class1_weight), 12.0, 6.0, 6.0)
+
     criterion = MARASSLoss(
         weights=LossWeights(
             recon=args.w_recon,
@@ -683,7 +733,25 @@ def main() -> None:
             holdout=args.w_holdout,
         ),
         bloom_threshold=2.5,
+        eri_class_weights=eri_class_weights,
     ).to(device)
+
+    if is_main:
+        log.info(
+            f"[v3.6] ERI class weights: {eri_class_weights}  "
+            f"(class-1 from --eri-class1-weight={args.eri_class1_weight})"
+        )
+        if args.w_aux_final != args.w_aux:
+            log.info(
+                f"[v3.6] MoE aux annealing: w_aux {args.w_aux} → {args.w_aux_final} "
+                f"linearly across epochs "
+                f"[{args.w_aux_anneal_start_epoch}, {args.w_aux_anneal_end_epoch}]"
+            )
+        else:
+            log.info(
+                f"[v3.6] MoE aux annealing disabled (--w-aux == --w-aux-final = "
+                f"{args.w_aux})"
+            )
 
     start_epoch       = 0
     global_step       = 0
@@ -713,6 +781,21 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         if using_ddp:
             loaders["train"].sampler.set_epoch(epoch)
+
+        # [v3.6] Apply MoE aux weight anneal for this epoch.
+        # criterion is plain nn.Module (not DDP-wrapped), so .w is accessible.
+        current_w_aux = w_aux_for_epoch(
+            epoch=epoch,
+            w_aux_start=args.w_aux,
+            w_aux_final=args.w_aux_final,
+            anneal_start_epoch=args.w_aux_anneal_start_epoch,
+            anneal_end_epoch=args.w_aux_anneal_end_epoch,
+        )
+        criterion.w.aux = current_w_aux
+        if is_main:
+            if writer is not None:
+                writer.add_scalar("train_epoch/w_aux", current_w_aux, epoch)
+            log.info(f"Epoch {epoch:03d} | w_aux = {current_w_aux:.5f}")
 
         train_metrics, global_step = run_epoch(
             model=model, loader=loaders["train"],
