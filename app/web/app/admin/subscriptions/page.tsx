@@ -1,14 +1,20 @@
 import Link from "next/link";
 
+export const dynamic = "force-dynamic";
+
 async function fetchSubscriptions() {
   const base  = process.env.INTERNAL_API_URL ?? "http://api:8000";
   const token = process.env.ADMIN_TOKEN ?? "";
-  const res   = await fetch(`${base}/api/admin/subscriptions?limit=100`, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache:   "no-store",
-  });
-  if (!res.ok) return { total: 0, items: [] };
-  return res.json();
+  try {
+    const res = await fetch(`${base}/api/admin/subscriptions?limit=100`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache:   "no-store",
+    });
+    if (!res.ok) return { total: 0, items: [] };
+    return res.json();
+  } catch {
+    return { total: 0, items: [] };
+  }
 }
 
 export default async function AdminSubscriptionsPage() {

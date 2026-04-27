@@ -2,15 +2,21 @@ import Link from "next/link";
 import { RunStatusPill } from "@/components/RunStatusPill";
 import type { RunSummary } from "@/lib/api";
 
+export const dynamic = "force-dynamic";
+
 async function fetchRuns(): Promise<RunSummary[]> {
-  const base = process.env.INTERNAL_API_URL ?? "http://api:8000";
+  const base  = process.env.INTERNAL_API_URL ?? "http://api:8000";
   const token = process.env.ADMIN_TOKEN ?? "";
-  const res   = await fetch(`${base}/api/admin/runs?limit=50`, {
-    headers:     { Authorization: `Bearer ${token}` },
-    cache:       "no-store",
-  });
-  if (!res.ok) return [];
-  return res.json();
+  try {
+    const res = await fetch(`${base}/api/admin/runs?limit=50`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache:   "no-store",
+    });
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
 }
 
 function durationStr(start?: string, end?: string): string {
