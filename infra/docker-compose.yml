@@ -1,0 +1,174 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MM-MARAS Dashboard — single-VM Docker Compose stack
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Postgres + PostGIS ─────────────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB:       ${POSTGRES_DB:-mmaras}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    ports:
+      - "127.0.0.1:5432:5432"   # bind only to localhost
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  # ── FastAPI + worker ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:     postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mmaras}
+      ADMIN_TOKEN:      ${ADMIN_TOKEN}
+      SECRET_KEY:       ${SECRET_KEY}
+      SMTP_HOST:        ${SMTP_HOST:-smtp.sendgrid.net}
+      SMTP_PORT:        ${SMTP_PORT:-587}
+      SMTP_USER:        ${SMTP_USER:-apikey}
+      SMTP_PASS:        ${SMTP_PASS}
+      SMTP_FROM:        ${SMTP_FROM:-noreply@mmaras.example.com}
+      TWILIO_SID:       ${TWILIO_SID}
+      TWILIO_TOKEN:     ${TWILIO_TOKEN}
+      TWILIO_FROM:      ${TWILIO_FROM}
+      PUBLIC_BASE_URL:  ${PUBLIC_BASE_URL:-http://localhost}
+    volumes:
+      - ./data:/data:ro
+      - ./app/playbook:/app/playbook:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  # ── Worker (inference + daily pipeline) ───────────────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    restart: "no"         # invoked on demand or by scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:             postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mmaras}
+      CHECKPOINT_PATH:          /checkpoints/${CHECKPOINT_FILE:-best.pt}
+      CHECKPOINT_BACKUP_DIR:    /backups
+      DATA_DIR:                 /data
+      CMEMS_USERNAME:           ${CMEMS_USERNAME}
+      CMEMS_PASSWORD:           ${CMEMS_PASSWORD}
+      CDSAPI_KEY:               ${CDSAPI_KEY}
+      SMTP_HOST:                ${SMTP_HOST:-smtp.sendgrid.net}
+      SMTP_PORT:                ${SMTP_PORT:-587}
+      SMTP_USER:                ${SMTP_USER:-apikey}
+      SMTP_PASS:                ${SMTP_PASS}
+      SMTP_FROM:                ${SMTP_FROM:-noreply@mmaras.example.com}
+      TWILIO_SID:               ${TWILIO_SID}
+      TWILIO_TOKEN:             ${TWILIO_TOKEN}
+      TWILIO_FROM:              ${TWILIO_FROM}
+      PUBLIC_BASE_URL:          ${PUBLIC_BASE_URL:-http://localhost}
+      ADMIN_TOKEN:              ${ADMIN_TOKEN}
+      SECRET_KEY:               ${SECRET_KEY}
+    volumes:
+      - ./data:/data:rw
+      - ./model/checkpoints:/checkpoints:ro
+      - ${CHECKPOINT_BACKUP_DIR:-./data/backups}:/backups:rw
+
+  # ── APScheduler (cron runner) ─────────────────────────────────────────────
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    command: ["python", "-m", "app.worker.scheduler"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:             postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mmaras}
+      CHECKPOINT_PATH:          /checkpoints/${CHECKPOINT_FILE:-best.pt}
+      CHECKPOINT_BACKUP_DIR:    /backups
+      DATA_DIR:                 /data
+      CMEMS_USERNAME:           ${CMEMS_USERNAME}
+      CMEMS_PASSWORD:           ${CMEMS_PASSWORD}
+      CDSAPI_KEY:               ${CDSAPI_KEY}
+      SMTP_HOST:                ${SMTP_HOST:-smtp.sendgrid.net}
+      SMTP_PORT:                ${SMTP_PORT:-587}
+      SMTP_USER:                ${SMTP_USER:-apikey}
+      SMTP_PASS:                ${SMTP_PASS}
+      SMTP_FROM:                ${SMTP_FROM:-noreply@mmaras.example.com}
+      TWILIO_SID:               ${TWILIO_SID}
+      TWILIO_TOKEN:             ${TWILIO_TOKEN}
+      TWILIO_FROM:              ${TWILIO_FROM}
+      PUBLIC_BASE_URL:          ${PUBLIC_BASE_URL:-http://localhost}
+      ADMIN_TOKEN:              ${ADMIN_TOKEN}
+      SECRET_KEY:               ${SECRET_KEY}
+    volumes:
+      - ./data:/data:rw
+      - ./model/checkpoints:/checkpoints:ro
+      - ${CHECKPOINT_BACKUP_DIR:-./data/backups}:/backups:rw
+
+  # ── Next.js frontend ───────────────────────────────────────────────────────
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE: /api
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  # ── Nginx reverse proxy + static file server ───────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./data/runs:/srv/static/runs:ro
+      - ./infra/certs:/etc/nginx/certs:ro   # optional TLS certs
+
+  # ── Mailpit (dev SMTP sink — override in production) ──────────────────────
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8025:8025"   # web UI
+      - "127.0.0.1:1025:1025"   # SMTP
+    profiles:
+      - dev
+
+volumes:
+  pgdata:
