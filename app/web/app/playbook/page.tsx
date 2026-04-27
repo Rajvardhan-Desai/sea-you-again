@@ -2,11 +2,18 @@ import Link from "next/link";
 import { PlaybookCard } from "@/components/PlaybookCard";
 import type { PlaybookBand } from "@/lib/api";
 
+// Skip build-time prerender — depends on the API which isn't reachable at build
+export const dynamic = "force-dynamic";
+
 async function fetchPlaybook(): Promise<{ bands: PlaybookBand[] }> {
   const base = process.env.INTERNAL_API_URL ?? "http://api:8000";
-  const res  = await fetch(`${base}/api/playbook`, { next: { revalidate: 3600 } });
-  if (!res.ok) return { bands: [] };
-  return res.json();
+  try {
+    const res = await fetch(`${base}/api/playbook`, { cache: "no-store" });
+    if (!res.ok) return { bands: [] };
+    return res.json();
+  } catch {
+    return { bands: [] };
+  }
 }
 
 export default async function PlaybookPage() {

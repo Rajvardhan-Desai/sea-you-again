@@ -2,15 +2,21 @@ import Link from "next/link";
 import { RunStatusPill } from "@/components/RunStatusPill";
 import type { RunSummary } from "@/lib/api";
 
+export const dynamic = "force-dynamic";
+
 async function fetchRun(id: string): Promise<RunSummary | null> {
   const base  = process.env.INTERNAL_API_URL ?? "http://api:8000";
   const token = process.env.ADMIN_TOKEN ?? "";
-  const res   = await fetch(`${base}/api/admin/runs/${id}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache:   "no-store",
-  });
-  if (!res.ok) return null;
-  return res.json();
+  try {
+    const res = await fetch(`${base}/api/admin/runs/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache:   "no-store",
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
 }
 
 export default async function RunDetailPage({ params }: { params: { id: string } }) {
