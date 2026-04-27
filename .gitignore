@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+infra/.env
+infra/certs/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Data / artifacts (large; keep out of git)
+data/
+*.npz
+*.nc
+model/checkpoints/*.pt
+
+# Node / Next.js
+node_modules/
+app/web/.next/
+app/web/out/
+app/web/node_modules/
+
+# Test DB
+test_mmaras.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log

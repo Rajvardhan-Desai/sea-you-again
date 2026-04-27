@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sea-you-again"
+version = "3.6.0"
+description = "MM-MARAS: Multi-Modal Mask-Aware Regime-Adaptive Spatiotemporal model for Bay of Bengal Chl-a forecasting"
+requires-python = ">=3.10"
+
+# Core research deps (GPU training / eval)
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "xarray>=2024.1",
+    "dask[array]>=2024.1",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+]
+
+[project.optional-dependencies]
+# pip install -e .[app]  — API + worker + inference
+app = [
+    # Web
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    # DB
+    "sqlalchemy>=2.0",
+    "geoalchemy2>=0.15",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
+    # Geo
+    "shapely>=2.0",
+    "rasterio>=1.3",
+    # Worker / scheduling
+    "apscheduler>=3.10",
+    "tenacity>=8.3",
+    # Notifications
+    "twilio>=9.0",
+    # Auth / tokens
+    "itsdangerous>=2.2",
+    # Observability
+    "prometheus-client>=0.20",
+    "structlog>=24.1",
+    # Data (used by ingest + preprocessing)
+    "copernicusmarine>=1.3",
+    "cdsapi>=0.7",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "anyio[trio]>=4.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "model*", "data-preprocessing-pipeline*"]

@@ -1,0 +1,46 @@
+bands:
+  - severity: low
+    bloom_prob_min: 0.30
+    bloom_prob_max: 0.50
+    eri_class: 2
+    actions:
+      - "Increase in-cage dissolved-oxygen (DO) monitoring frequency to 4×/day."
+      - "Stage emergency aerators near high-density pens; test before deployment."
+      - "Notify duty officer; review next 24 h forecast at 09:00 IST."
+      - "Log any observed water discolouration or fish behaviour changes."
+
+  - severity: moderate
+    bloom_prob_min: 0.50
+    bloom_prob_max: 0.70
+    eri_class: 3
+    actions:
+      - "Reduce feeding by 30 % to lower oxygen demand."
+      - "Pre-position oxygen cylinders and backup aerators at cage sites."
+      - "Suspend stocking and grading operations until risk subsides."
+      - "Brief boat captains on alternate fishing grounds outside the risk AOI."
+      - "Coordinate with district fisheries officer on optimal harvest timing."
+      - "Begin documenting stock counts for potential insurance claims."
+
+  - severity: high
+    bloom_prob_min: 0.70
+    bloom_prob_max: 0.85
+    eri_class: 4
+    actions:
+      - "Initiate emergency early harvest of all market-ready stock."
+      - "Tow mobile cages out of plume centroid if logistically feasible."
+      - "Activate aerators continuously; switch to liquid-oxygen supplementation."
+      - "File a risk advisory with the state pollution control board."
+      - "Issue public-health advisory regarding shellfish consumption near AOI."
+      - "Alert neighbouring farms and fishing cooperatives in the zone."
+
+  - severity: severe
+    bloom_prob_min: 0.85
+    bloom_prob_max: 1.01
+    eri_class: 4
+    actions:
+      - "Trigger total harvest / relocation protocol within 24 h — no exceptions."
+      - "Halt all aquaculture intake from the affected coastline immediately."
+      - "Coordinate with Coast Guard for broadcast alerts to at-sea operators."
+      - "Notify NIOT / INCOIS for emergency ground-truth water sampling."
+      - "Activate emergency response cell; document all losses with timestamps."
+      - "Contact state aquaculture department for disaster-relief registration."

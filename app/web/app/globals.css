@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Leaflet base styles (must be imported globally) */
+@import "leaflet/dist/leaflet.css";
+@import "leaflet-draw/dist/leaflet.draw.css";
+
+:root {
+  --ocean-dark: #0c4a6e;
+}
+
+body {
+  min-height: 100vh;
+}
+
+/* Map container fills available space without scrollbars */
+.map-full {
+  height: calc(100vh - 4rem);
+  width: 100%;
+}

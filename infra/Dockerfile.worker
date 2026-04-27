@@ -1,0 +1,30 @@
+# Worker image — needs full research stack + CUDA (optional) + app extras
+# Use pytorch base for GPU support; fall back to CPU-only if CUDA unavailable at runtime.
+FROM python:3.11
+
+WORKDIR /workspace
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgdal-dev libgeos-dev libproj-dev \
+        gcc g++ git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Research deps first (PyTorch — install CPU variant for portability)
+RUN pip install --no-cache-dir \
+    torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Copy entire repo (model code, preprocessing, app)
+COPY pyproject.toml ./
+COPY model/ ./model/
+COPY data-preprocessing-pipeline/ ./data-preprocessing-pipeline/
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+
+# Install research deps + app extras
+RUN pip install --no-cache-dir -e ".[app]"
+RUN pip install --no-cache-dir pyyaml
+
+# Default command — overridden per-service in docker-compose
+CMD ["python", "-m", "app.worker.daily_run"]
