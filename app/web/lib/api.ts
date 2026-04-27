@@ -53,6 +53,7 @@ export interface RunSummary {
   ingest_summary?:   Record<string, unknown>;
   inference_metrics?: Record<string, unknown>;
   error_text?:       string;
+  artifacts_path?:   string;
 }
 
 export interface AlertOut {
