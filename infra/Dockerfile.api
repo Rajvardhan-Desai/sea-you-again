@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+# System deps needed by geoalchemy2 / rasterio / shapely
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgdal-dev libgeos-dev libproj-dev \
+        gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only the parts the API needs (no model weights, no training code)
+COPY pyproject.toml ./
+COPY app/ ./app/
+COPY alembic.ini ./
+
+# Install app extras only
+RUN pip install --no-cache-dir -e ".[app]"
+# Also install pyyaml (used by playbook router)
+RUN pip install --no-cache-dir pyyaml
+
+EXPOSE 8000
+CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
