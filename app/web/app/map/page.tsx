@@ -18,9 +18,12 @@ export default function MapPage() {
     );
   }
   if (error || !forecast) {
+    const isServiceDown = error && /^5\d\d/.test((error as Error).message);
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-ocean-900 text-red-400 gap-4">
-        <p>No forecast data available yet.</p>
+        <p>{isServiceDown
+          ? "Forecast service unavailable — try again shortly."
+          : "No forecast data available yet."}</p>
         <Link href="/" className="text-ocean-100 underline text-sm">← Back</Link>
       </div>
     );
