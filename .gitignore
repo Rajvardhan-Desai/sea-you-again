@@ -45,3 +45,5 @@ test_mmaras.db
 *.log
 
 .claude/worktrees/
+
+*.pt
