@@ -43,3 +43,7 @@ test_mmaras.db
 
 # Logs
 *.log
+
+.claude/worktrees/
+
+*.pt
