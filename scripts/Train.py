@@ -231,8 +231,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-aux-anneal-start-epoch", type=int, default=5,
                    help="[v3.6] Epoch at which w_aux annealing starts (default 5, "
                         "matches --warmup-epochs).")
-    p.add_argument("--w-aux-anneal-end-epoch", type=int, default=30,
-                   help="[v3.6] Epoch at which w_aux reaches --w-aux-final (default 30).")
+    p.add_argument("--w-aux-anneal-end-epoch", type=int, default=18,
+                   help="[v3.6] Epoch at which w_aux reaches --w-aux-final (default 18).")
     p.add_argument("--w-holdout",  type=float, default=0.8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None)
