@@ -148,6 +148,7 @@ services:
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_BASE: /api
+      HOSTNAME: "0.0.0.0"
     ports:
       - "127.0.0.1:3000:3000"
     healthcheck:
