@@ -47,3 +47,4 @@ test_mmaras.db
 .claude/worktrees/
 
 *.pt
+.claude/settings.local.json
