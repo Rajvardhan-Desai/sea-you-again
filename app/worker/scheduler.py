@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 from datetime import date, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -23,6 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.worker.checkpoint_backup import run_backup
 from app.worker.daily_run import run as daily_run
+from app.worker.trigger_listener import listen as trigger_listen
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,10 @@ def main() -> None:
     scheduler.add_job(_daily_job,  CronTrigger(hour=2,  minute=0), id="daily_run",  misfire_grace_time=3600)
     scheduler.add_job(_backup_job, CronTrigger(hour=3,  minute=0), id="ckpt_backup", misfire_grace_time=3600)
 
+    # Ad-hoc job listener (api -> Redis -> here). Daemon so it dies with the
+    # scheduler; jobs are processed serially inside this thread.
+    threading.Thread(target=trigger_listen, name="trigger_listener", daemon=True).start()
+
     def _shutdown(sig, frame):
         log.info("[scheduler] Shutting down...")
         scheduler.shutdown(wait=False)
@@ -63,7 +69,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
 
-    log.info("[scheduler] Started — daily_run@02:00 UTC, ckpt_backup@03:00 UTC")
+    log.info("[scheduler] Started — daily_run@02:00 UTC, ckpt_backup@03:00 UTC, "
+             "ad-hoc trigger listener active")
     scheduler.start()
 
 

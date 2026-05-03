@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { RunStatusPill } from "@/components/RunStatusPill";
+import { TriggerRunForm, RetryButton } from "@/components/RunControls";
 import type { RunSummary } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -72,9 +73,7 @@ export default async function AdminRunsPage() {
                     Detail
                   </Link>
                   {run.status === "failed" && (
-                    <form action={`/api/admin/runs/${run.id}/retry?phase=ingest`} method="post">
-                      <button className="text-yellow-400 hover:text-yellow-200">Retry</button>
-                    </form>
+                    <RetryButton runId={run.id} />
                   )}
                 </td>
               </tr>
@@ -83,20 +82,7 @@ export default async function AdminRunsPage() {
         </table>
       </div>
 
-      {/* Manual trigger */}
-      <form action="/api/admin/runs/trigger" method="post" className="mt-6 flex gap-3 items-center">
-        <input
-          type="date"
-          name="run_date"
-          className="bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm"
-        />
-        <button
-          type="submit"
-          className="bg-ocean-500 hover:bg-ocean-700 rounded px-4 py-2 text-sm font-semibold transition"
-        >
-          Trigger Run
-        </button>
-      </form>
+      <TriggerRunForm />
     </div>
   );
 }

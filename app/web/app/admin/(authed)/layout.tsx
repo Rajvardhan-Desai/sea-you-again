@@ -1,15 +1,13 @@
+import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import Link from "next/link";
 
-export default function AdminLayout({
+export default function AdminAuthedLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const cookieStore = cookies();
-  const token = cookieStore.get("mm_admin");
-  if (!token) {
+  if (!cookies().get("mm_admin")) {
     redirect("/admin/login");
   }
 

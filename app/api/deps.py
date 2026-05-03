@@ -9,7 +9,7 @@ from __future__ import annotations
 import secrets
 from typing import Generator
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -33,12 +33,18 @@ _bearer = HTTPBearer(auto_error=False)
 
 def require_admin(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    mm_admin: str | None = Cookie(default=None),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    """Raise 401 if the bearer token does not match ADMIN_TOKEN."""
-    if credentials is None or not secrets.compare_digest(
-        credentials.credentials, settings.admin_token
-    ):
+    """Raise 401 unless the request carries the ADMIN_TOKEN.
+
+    Accepts either an `Authorization: Bearer <token>` header (used by
+    server-to-server callers and the Next.js server-side fetches) or an
+    `mm_admin` cookie set by `POST /api/admin/session` (used by browser
+    form posts from the admin UI).
+    """
+    presented = credentials.credentials if credentials else mm_admin
+    if presented is None or not secrets.compare_digest(presented, settings.admin_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing admin token",

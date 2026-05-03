@@ -26,14 +26,15 @@ def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS postgis")
     op.execute("CREATE EXTENSION IF NOT EXISTS citext")
 
-    # Enums
+    # Enums — create_type=False so create_table below does not re-attempt creation
     run_status  = postgresql.ENUM(
         "pending", "ingesting", "inferring", "alerting",
         "succeeded", "failed", "partial",
         name="run_status",
+        create_type=False,
     )
-    src_status  = postgresql.ENUM("ok", "retrying", "failed", name="source_status")
-    src_name    = postgresql.ENUM("cmems_chl", "cmems_phys", "era5", "glofas", name="source_name")
+    src_status  = postgresql.ENUM("ok", "retrying", "failed", name="source_status", create_type=False)
+    src_name    = postgresql.ENUM("cmems_chl", "cmems_phys", "era5", "glofas", name="source_name", create_type=False)
     run_status.create(op.get_bind(), checkfirst=True)
     src_status.create(op.get_bind(), checkfirst=True)
     src_name.create(op.get_bind(), checkfirst=True)
@@ -127,3 +128,6 @@ def downgrade() -> None:
     op.drop_table("subscriptions")
     op.drop_table("data_sources")
     op.drop_table("runs")
+    op.execute("DROP TYPE IF EXISTS run_status")
+    op.execute("DROP TYPE IF EXISTS source_status")
+    op.execute("DROP TYPE IF EXISTS source_name")

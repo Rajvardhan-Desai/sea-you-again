@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/mmaras"
 
+    # Redis (job dispatch from api -> scheduler/worker)
+    redis_url: str = "redis://redis:6379/0"
+
     # Auth
     admin_token: str = "changeme"
     secret_key:  str = "changeme-secret-for-itsdangerous"

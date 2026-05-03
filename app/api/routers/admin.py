@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import secrets
-import subprocess
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import desc
@@ -24,6 +26,19 @@ from app.api.schemas.admin import (
 )
 from app.api.settings import Settings, get_settings
 from app.db.models import Alert, DataSource, Run, Subscription
+
+log = logging.getLogger(__name__)
+
+# Redis queue keys consumed by app.worker.trigger_listener (running in the
+# scheduler container, which has the heavy ML deps + checkpoint mount).
+TRIGGER_QUEUE = "mmaras:trigger_run"
+RETRY_QUEUE   = "mmaras:retry_run"
+BACKUP_QUEUE  = "mmaras:checkpoint_backup"
+
+
+def _enqueue(settings: Settings, queue: str, payload: dict) -> None:
+    client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    client.lpush(queue, json.dumps(payload, default=str))
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -84,14 +99,15 @@ def trigger_run(
     if existing and existing.status in ("ingesting", "inferring", "alerting"):
         raise HTTPException(status_code=409, detail=f"Run for {target_date} already in progress.")
 
-    # Spawn as background subprocess — worker container handles it
-    subprocess.Popen(
-        ["python", "-m", "app.worker.daily_run", "--date", str(target_date),
-         "--triggered-by", "admin:api"],
-        start_new_session=True,
-    )
+    # Dispatch to the scheduler container via Redis — that container has the
+    # heavy ML deps, the data-preprocessing-pipeline source, and the model
+    # checkpoint mount. The api container has none of those.
+    _enqueue(settings, TRIGGER_QUEUE, {
+        "run_date":     str(target_date),
+        "triggered_by": "admin:api",
+    })
 
-    # Return stub (the subprocess will upsert the DB row)
+    # Return stub (the worker will upsert the DB row when it picks the job up)
     if existing:
         return RunSummary.model_validate(existing)
     stub = Run(
@@ -110,17 +126,17 @@ def retry_run(
     run_id: uuid.UUID,
     phase:  str = Query("ingest", pattern="^(ingest|infer|alert)$"),
     db:     Session = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     run = db.query(Run).filter(Run.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found.")
-    subprocess.Popen(
-        ["python", "-m", "app.worker.daily_run",
-         "--date", str(run.run_date),
-         "--triggered-by", "admin:retry",
-         "--start-phase", phase],
-        start_new_session=True,
-    )
+    _enqueue(settings, RETRY_QUEUE, {
+        "run_id":       str(run_id),
+        "run_date":     str(run.run_date),
+        "phase":        phase,
+        "triggered_by": "admin:retry",
+    })
     return {"status": "retry_dispatched", "run_id": str(run_id), "phase": phase}
 
 
@@ -184,11 +200,10 @@ def admin_delete_subscription(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @router.post("/checkpoint-backup")
-def trigger_checkpoint_backup() -> dict:
-    subprocess.Popen(
-        ["python", "-m", "app.worker.checkpoint_backup"],
-        start_new_session=True,
-    )
+def trigger_checkpoint_backup(
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    _enqueue(settings, BACKUP_QUEUE, {"triggered_by": "admin:api"})
     return {"status": "backup_dispatched"}
 
 

@@ -35,20 +35,20 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 
 
 def _run_migrations() -> None:
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=str(_REPO),
-            capture_output=True,
-            text=True,
-            timeout=60,
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=str(_REPO),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        log.error(
+            "Alembic migration failed:\nstdout:\n%s\nstderr:\n%s",
+            result.stdout, result.stderr,
         )
-        if result.returncode != 0:
-            log.warning(f"Alembic migration warning:\n{result.stderr}")
-        else:
-            log.info("DB migrations: up to date.")
-    except Exception as exc:
-        log.error(f"Alembic migration failed: {exc}")
+        raise RuntimeError("Database migration failed — refusing to start.")
+    log.info("DB migrations: up to date.")
 
 
 def create_app() -> FastAPI:
@@ -90,17 +90,27 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health", tags=["health"])
     def health() -> dict:
-        from app.db.session import engine
-        from sqlalchemy import text
-        from app.db.models import Run
+        from fastapi import HTTPException
+        from sqlalchemy.exc import SQLAlchemyError
         from sqlalchemy.orm import Session
 
-        with Session(engine) as db:
-            try:
-                latest = db.query(Run).filter(Run.status == "succeeded").order_by(Run.run_date.desc()).first()
-                latest_date = str(latest.run_date) if latest else None
-            except Exception:
-                latest_date = None
+        from app.db.models import Run
+        from app.db.session import engine
+
+        try:
+            with Session(engine) as db:
+                latest = (
+                    db.query(Run)
+                    .filter(Run.status == "succeeded")
+                    .order_by(Run.run_date.desc())
+                    .first()
+                )
+            latest_date = str(latest.run_date) if latest else None
+        except SQLAlchemyError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"db unavailable: {exc.__class__.__name__}",
+            )
 
         return {
             "status":           "ok",

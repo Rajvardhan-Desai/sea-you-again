@@ -91,6 +91,114 @@ def _persist_data_sources(db, run, ingest_result) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Inference-only batch builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_inference_batch(
+    mask_ds,
+    normalized:   dict,
+    static_arr:   np.ndarray,
+    time_window:  int,
+    patch_size:   int,
+    phy_vars:     list,
+    bgc_aux_vars: list,
+    dis_vars:     list,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    """
+    Build a single-sample inference batch from full-domain preprocessed arrays.
+
+    Takes the most recent `time_window` timesteps and crops the top-left
+    `patch_size × patch_size` region. NaN handling matches the training-time
+    dataset loader (see data-preprocessing-pipeline/dataset.py): land_mask is
+    derived from static NaNs, then static and other "silent NaN" tensors are
+    filled with 0.0; chl_obs NaNs (cloud/glint) are also filled with 0.0 because
+    obs_mask already encodes which pixels were missing.
+
+    target_chl and target_mask are placeholders here — `forward_with_routing`
+    does not use them, but downstream postprocessing (ecosystem_impact) reads
+    `static` and `land_mask`.
+
+    Returns
+    -------
+    batch       : dict[str, np.ndarray]   single-sample (no batch dim)
+    crop_lats   : np.ndarray (patch_size,)  latitudes of the cropped patch
+    crop_lons   : np.ndarray (patch_size,)  longitudes of the cropped patch
+    """
+    chl_var = normalized["chl"]["chl"]
+    if "depth" in chl_var.dims:
+        chl_var = chl_var.isel(depth=0, drop=True)
+
+    T_full = chl_var.sizes["time"]
+    if T_full < time_window:
+        raise RuntimeError(
+            f"Need {time_window} timesteps for inference but only have {T_full}. "
+            f"Widen the ingest window in app/worker/ingest.py:_date_window."
+        )
+
+    H_full = chl_var.sizes["lat"]
+    W_full = chl_var.sizes["lon"]
+    if H_full < patch_size or W_full < patch_size:
+        raise RuntimeError(
+            f"Domain {H_full}×{W_full} smaller than patch size {patch_size}."
+        )
+
+    t_sl = slice(T_full - time_window, T_full)
+    r_sl = slice(0, patch_size)
+    c_sl = slice(0, patch_size)
+
+    chl_np   = chl_var.values[t_sl,   r_sl, c_sl].astype(np.float32)
+    obs_np   = mask_ds["obs_mask"].values  [t_sl, r_sl, c_sl].astype(np.float32)
+    mcar_np  = mask_ds["mcar_mask"].values [t_sl, r_sl, c_sl].astype(np.float32)
+    mnar_np  = mask_ds["mnar_mask"].values [t_sl, r_sl, c_sl].astype(np.float32)
+    bloom_np = mask_ds["bloom_mask"].values[t_sl, r_sl, c_sl].astype(np.float32)
+
+    physics_np = np.stack(
+        [normalized["physics"][v].values[t_sl] for v in phy_vars],
+        axis=1,
+    )[:, :, r_sl, c_sl].astype(np.float32)
+
+    wind_np = np.stack([
+        normalized["wind"]["u10"].values[t_sl],
+        normalized["wind"]["v10"].values[t_sl],
+        normalized["wind"]["msl"].values[t_sl],
+        normalized["precip"]["tp"].values[t_sl],
+    ], axis=1)[:, :, r_sl, c_sl].astype(np.float32)
+
+    discharge_np = np.stack(
+        [normalized["discharge"][v].values[t_sl] for v in dis_vars],
+        axis=1,
+    )[:, :, r_sl, c_sl].astype(np.float32)
+
+    bgc_aux_np = np.stack(
+        [normalized["bgc_aux"][v].values[t_sl] for v in bgc_aux_vars],
+        axis=1,
+    )[:, :, r_sl, c_sl].astype(np.float32)
+
+    static_cropped = static_arr[:, r_sl, c_sl].astype(np.float32)
+    land_mask_2d   = np.isnan(static_cropped).any(axis=0).astype(np.float32)
+
+    batch = {
+        "chl_obs":     np.nan_to_num(chl_np,        nan=0.0),
+        "obs_mask":    obs_np,
+        "mcar_mask":   mcar_np,
+        "mnar_mask":   mnar_np,
+        "physics":     np.nan_to_num(physics_np,    nan=0.0),
+        "wind":        np.nan_to_num(wind_np,       nan=0.0),
+        "discharge":   np.nan_to_num(discharge_np,  nan=0.0),
+        "bgc_aux":     np.nan_to_num(bgc_aux_np,    nan=0.0),
+        "static":      np.nan_to_num(static_cropped, nan=0.0),
+        "bloom_mask":  bloom_np,
+        "target_chl":  np.zeros((5, patch_size, patch_size), dtype=np.float32),
+        "land_mask":   land_mask_2d,
+        "target_mask": np.ones((5, patch_size, patch_size),  dtype=np.float32),
+    }
+
+    crop_lats = chl_var.lat.values[r_sl]
+    crop_lons = chl_var.lon.values[c_sl]
+    return batch, crop_lats, crop_lons
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Phase 2-7: full inference
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -128,41 +236,58 @@ def _run_inference(
         batch_np = np.load(fixture_path, allow_pickle=True)
         batch = {k: torch.from_numpy(np.array(batch_np[k])).unsqueeze(0).to(device)
                  for k in batch_np.files}
+        bbox = None  # fixture: caller-provided; falls through to domain default below
+        crop_lats = crop_lons = None
     else:
-        # Preprocess raw data → patches
-        from pipeline import run_pipeline  # type: ignore[import]
-        import config as cfg               # type: ignore[import]
-
-        patch_dir = run_dir / "patches"
-        run_pipeline(
-            domain          = cfg.ACTIVE_DOMAIN,
-            download        = False,
-            chl_path        = str(raw_dir / "cmems_chl.nc"),
-            phys_path       = str(raw_dir / "cmems_phys.nc"),
-            era5_wind_path  = str(raw_dir / "era5_wind.nc"),
-            era5_msl_path   = str(raw_dir / "era5_msl.nc"),
-            era5_precip_path = str(raw_dir / "era5_precip.nc"),
-            discharge_path  = str(raw_dir / "glofas.nc"),
-            output_dir      = str(patch_dir),
-            recompute_stats = False,
+        # Inference-only preprocessing: skip patch extraction (which requires
+        # T_INPUT + H = 15 timesteps per train/val/test split). For inference we
+        # only need the most recent T_INPUT=10 timesteps fed forward through the
+        # model, which then forecasts H=5 days ahead.
+        from pipeline import (  # type: ignore[import]
+            step_load_and_align, step_build_masks, step_normalize, step_build_static,
         )
+        import config as cfg  # type: ignore[import]
 
-        from dataset import build_dataloaders  # type: ignore[import]
-        loaders = build_dataloaders(
-            patch_dir  = str(patch_dir),
-            batch_size = 8,
-            num_workers = 2,
-            pin_memory  = (device.type == "cuda"),
+        cfg.STATS_DIR = str(Path(settings.data_dir) / "stats")
+
+        domain     = cfg.DOMAINS[cfg.ACTIVE_DOMAIN]
+        stats_path = str(Path(cfg.STATS_DIR) / f"norm_stats_{cfg.ACTIVE_DOMAIN}.json")
+
+        # Bathymetry: prefer the local GEBCO NetCDF if present (drop at
+        # <data_dir>/raw/gebco_bob.nc). Falls back to None → step_build_static
+        # uses cfg.BATHY_PATH or zeros placeholder.
+        gebco_path = Path(settings.data_dir) / "raw" / "gebco_bob.nc"
+        bathy_path = str(gebco_path) if gebco_path.exists() else None
+        if bathy_path:
+            log.info(f"Using bathymetry: {bathy_path}")
+
+        paths = {
+            "chl":         str(raw_dir / "cmems_chl.nc"),
+            "physics":     str(raw_dir / "cmems_phys.nc"),
+            "bathy":       bathy_path,
+            "era5_wind":   str(raw_dir / "era5_wind.nc"),
+            "era5_msl":    str(raw_dir / "era5_msl.nc"),
+            "era5_precip": str(raw_dir / "era5_precip.nc"),
+            "discharge":   str(raw_dir / "glofas.nc"),
+        }
+
+        aligned    = step_load_and_align(paths, domain)
+        mask_ds    = step_build_masks(aligned)
+        normalized = step_normalize(aligned, mask_ds, stats_path, recompute_stats=False)
+        static_arr = step_build_static(aligned["chl"], paths.get("bathy"))
+
+        batch_np, crop_lats, crop_lons = _build_inference_batch(
+            mask_ds      = mask_ds,
+            normalized   = normalized,
+            static_arr   = static_arr,
+            time_window  = cfg.TIME_WINDOW,
+            patch_size   = 64,
+            phy_vars     = cfg.PHY_VARIABLES,
+            bgc_aux_vars = cfg.BGC_AUX_VARIABLES,
+            dis_vars     = cfg.DISCHARGE_VARIABLES,
         )
-        # Use all splits in sequence for full-domain coverage
-        all_batches = []
-        for split in ("train", "val", "test"):
-            for b in loaders.get(split, []):
-                all_batches.append(b)
-        if not all_batches:
-            raise RuntimeError("No patches produced by pipeline.")
-        # For simplicity use the first batch; production would stitch all patches
-        batch = {k: v.to(device) for k, v in all_batches[0].items()}
+        batch = {k: torch.from_numpy(v).unsqueeze(0).to(device)
+                 for k, v in batch_np.items()}
 
     # ── Forward pass ──
     _update_run_status(db, run, "inferring")
@@ -194,15 +319,22 @@ def _run_inference(
     np.savez_compressed(str(run_dir / "eri.npz"),      eri=eri_np)
     np.savez_compressed(str(run_dir / "impact.npz"),   impact=impact_np)
 
-    # ── Compute bbox from config ──
-    try:
-        import config as cfg  # type: ignore[import]
-        dom = cfg.DOMAIN
-        bbox = [float(dom["minlon"]), float(dom["minlat"]),
-                float(dom["maxlon"]), float(dom["maxlat"])]
-    except Exception:
-        H, W = recon_np.shape
-        bbox = [78.0, 5.0, 100.0, 23.0]   # Bay of Bengal default
+    # ── Compute bbox ──
+    # When we built the batch from a 64×64 crop, use that crop's lat/lon range so
+    # the rendered overlay aligns with the exact pixels the model saw. Otherwise
+    # fall back to the full-domain bbox (fixture path, where we don't know the
+    # crop geometry).
+    if crop_lats is not None and crop_lons is not None:
+        bbox = [float(crop_lons.min()), float(crop_lats.min()),
+                float(crop_lons.max()), float(crop_lats.max())]
+    else:
+        try:
+            import config as cfg  # type: ignore[import]
+            dom = cfg.DOMAINS[cfg.ACTIVE_DOMAIN]
+            bbox = [float(dom["lon_min"]), float(dom["lat_min"]),
+                    float(dom["lon_max"]), float(dom["lat_max"])]
+        except Exception:
+            bbox = [78.0, 5.0, 100.0, 23.0]   # Bay of Bengal default
 
     # ── Horizon dates ──
     horizons = [str(target_date + timedelta(days=i + 1)) for i in range(5)]
@@ -272,8 +404,12 @@ def run(
             db.commit()
             db.refresh(run_row)
         else:
+            # Re-trigger: reset per-attempt fields so a successful retry doesn't
+            # show stale error_text or an inflated duration from the first attempt.
             run_row.triggered_by   = triggered_by
-            run_row.started_at     = run_row.started_at or datetime.now(timezone.utc)
+            run_row.started_at     = datetime.now(timezone.utc)
+            run_row.finished_at    = None
+            run_row.error_text     = None
             run_row.artifacts_path = str(run_dir)
             db.commit()
 
